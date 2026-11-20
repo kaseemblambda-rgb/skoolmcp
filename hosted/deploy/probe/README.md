@@ -18,7 +18,7 @@ The revised hosted-only release gate is separate:
 python -I hosted/deploy/run_release_tests.py
 ```
 
-It requires 116 tests with no failures, errors or skips. It explicitly rejects
+It requires 124 tests with no failures, errors or skips. It explicitly rejects
 hosted/runtime/test imports from another checkout, including editable-install
 fallbacks. test-gate.json names the exact modules. Fixtures are in-memory helpers
 in test_hosted_popup.py and test_hosted_analytics.py; no member exports or saved
@@ -89,8 +89,14 @@ reads run. The executable must match the root-owned, non-writable Playwright
 binary under /opt/playwright; UIDs, namespace mapping and process start times must
 match. A second CDP inventory and repeated kernel evidence must remain stable.
 No raw process argument is used to recognize renderer roles. Browser command
-arguments are inspected internally through CDP to reject sandbox-disabling flags;
-they are never printed. Unsupported CDP commands fail closed without adding flags.
+arguments are read only from the verified browser's pinned /proc directory to
+reject sandbox-disabling flags; they are never printed. Before cmdline is opened,
+its PID/start time, UIDs, executable inode and namespaces must match the verified
+browser, and /proc/exe must resolve to the trusted Playwright binary. Reads use
+O_NOFOLLOW, a 64 KiB limit, at most 4096 NUL-delimited arguments and a required
+terminator. The repeated evidence check also rechecks the browser command line.
+Browser.getBrowserCommandLine is never called: Playwright 1.64.1 does not supply
+the enable-automation switch required by that CDP method. No launch flags change.
 
 Every renderer must have NoNewPrivs=1, Seccomp=2, CapEff=0, nested PID and separate
 network namespaces. Seccomp_filters must exceed its browser process baseline,
@@ -104,14 +110,33 @@ unconfined seccomp to get a pass. Production launch flags/images remain unchange
 Discovery/exit/inventory races take at most four snapshots with three 250 ms waits.
 Observed unsafe, unreadable or invalid security evidence fails immediately.
 On success or failure, sandbox_counts reports allowlisted integer categories only,
-including CDP renderer counts, namespace confirmations and extra-filter evidence.
+including CDP renderer observations, namespace confirmations and extra-filter
+evidence. Query/read counters include both verification passes.
 CDP alone cannot authorize a pass. CDP requests and detach have bounded timeouts.
 Raw process arguments, IDs, status records, cookies and CDP responses never leave
 the quiet diagnostic boundary. Failure still exits before starting the listener.
 
 Kernel field definitions: [proc_pid_status(5)](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html).
 CDP methods: [official protocol](https://chromedevtools.github.io/devtools-protocol/tot/SystemInfo/#method-getProcessInfo)
-and [Browser.getBrowserCommandLine](https://chromedevtools.github.io/devtools-protocol/tot/Browser/#method-getBrowserCommandLine).
+and [proc_pid_cmdline(5)](https://man7.org/linux/man-pages/man5/proc_pid_cmdline.5.html).
+
+Failure stages have separate fixed categories (never upstream exception text):
+
+| Stage | Failure code |
+| --- | --- |
+| CDP session | E_SANDBOX_CDP_SESSION |
+| CDP process query | E_SANDBOX_CDP_PROCESS_QUERY |
+| CDP process response validation | E_SANDBOX_CDP_PROCESS_INVALID |
+| Command-line access denied | E_SANDBOX_CMDLINE_DENIED |
+| Command line disappeared | E_SANDBOX_CMDLINE_UNAVAILABLE |
+| Command-line read error | E_SANDBOX_CMDLINE_READ |
+| Malformed or oversized command line | E_SANDBOX_CMDLINE_INVALID |
+
+Identity and every existing kernel restriction retain their fail-closed checks.
+Only discovery/exit races use the bounded retry; command-line failures never fall
+back to CDP, skip a browser or authorize a pass. Detach failures are counted while
+browser/job cleanup remains mandatory. No cookies, credentials or raw arguments
+are added to the diagnostic output.
 
 On PASS, only /healthz and /result are exposed, with fixed check names and boolean
 flags. MCP and /job are never mounted on the listener. On failure, output is a

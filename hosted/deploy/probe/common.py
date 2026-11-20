@@ -16,6 +16,8 @@ SANDBOX_COUNTS=frozenset({
     'security_fields_missing','cdp_queries_ok','cdp_queries_failed','cdp_rows_truncated',
     'cdp_renderer_ids','cdp_renderer_visible','cdp_renderer_descendants',
     'extra_seccomp_filter_confirmed','namespace_confirmed','renderer_evidence_confirmed',
+    'cdp_session_failed','cdp_process_query_failed','cdp_process_invalid',
+    'cdp_process_missing','cdp_detach_failed','cmdline_invalid','cmdline_read_failed',
 })
 
 

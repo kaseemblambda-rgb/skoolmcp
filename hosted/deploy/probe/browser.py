@@ -56,18 +56,19 @@ def descendants(records=None,root_pid=None):
     return {pid:records[pid]for pid in own}
 
 
-def process_evidence(pid,proc=Path('/proc')):
+def process_evidence(pid,proc=Path('/proc'),*,browser_expected=None,counts=None):
     """Pin a proc directory, read bounded kernel evidence, detect exit/PID reuse.
 
     Internal return values contain identifiers. Only safe_counts may be emitted.
-    No cmdline, environment, page contents or cookies are read here.
+    Only a previously verified browser may request a bounded command-line read.
+    No environment, page contents or cookies are read here.
     """
-    fd=None
+    fd=None;counts=counts if counts is not None else {}
     try:
         fd=os.open(proc/str(pid),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-        def read(name):
+        def read(name,binary=False):
             child=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd)
-            with os.fdopen(child,'r')as stream:value=stream.read(65537)
+            with os.fdopen(child,'rb'if binary else'r')as stream:value=stream.read(65537)
             if len(value)>65536:raise ValueError()
             return value
         def start(value):
@@ -88,9 +89,38 @@ def process_evidence(pid,proc=Path('/proc')):
         security={name:int(fields[name],16 if name=='CapEff'else 10)
                   for name in ('NoNewPrivs','Seccomp','CapEff','Seccomp_filters')}
         if min(security.values())<0:raise ValueError()
+        value=dict(pid=pid,nspid=nspid,uid=uid,start=first,exe=(exe.st_dev,exe.st_ino),
+                   namespaces=namespaces,**security)
+        if browser_expected is not None:
+            # Check identity before opening cmdline, using this same pinned proc fd.
+            require(value==browser_expected,'E_SANDBOX_IDENTITY')
+            require(trusted_executable(os.readlink('exe',dir_fd=fd))==value['exe'],'E_SANDBOX_IDENTITY')
+            try:
+                raw=read('cmdline',binary=True)
+                if not raw.endswith(b'\0'):raise ValueError()
+                args=tuple(raw[:-1].split(b'\0'))
+                if not args or not args[0]or len(args)>4096:raise ValueError()
+            except PermissionError:
+                counts['cmdline_denied']=counts.get('cmdline_denied',0)+1
+                raise ProbeFailure('E_SANDBOX_CMDLINE_DENIED')from None
+            except (FileNotFoundError,ProcessLookupError):
+                counts['cmdline_disappeared']=counts.get('cmdline_disappeared',0)+1
+                raise ProbeFailure('E_SANDBOX_CMDLINE_UNAVAILABLE')from None
+            except ValueError:
+                counts['cmdline_invalid']=counts.get('cmdline_invalid',0)+1
+                raise ProbeFailure('E_SANDBOX_CMDLINE_INVALID')from None
+            except OSError:
+                counts['cmdline_read_failed']=counts.get('cmdline_read_failed',0)+1
+                raise ProbeFailure('E_SANDBOX_CMDLINE_READ')from None
+            counts['cmdline_readable']=counts.get('cmdline_readable',0)+1
+            disabled=any(arg.split(b'=',1)[0]in {flag.encode('ascii')for flag in DISABLED_SANDBOX_FLAGS}for arg in args)
+            counts['sandbox_disabled']=int(disabled)
+            require(not disabled,'E_SANDBOX_DISABLED')
+            value['arguments']=args
         if start(read('stat'))!=first:raise ValueError()
-        return dict(pid=pid,nspid=nspid,uid=uid,start=first,exe=(exe.st_dev,exe.st_ino),
-                    namespaces=namespaces,**security)
+        final_exe=os.stat('exe',dir_fd=fd)
+        require((final_exe.st_dev,final_exe.st_ino)==value['exe'],'E_SANDBOX_IDENTITY')
+        return value
     except (FileNotFoundError,ProcessLookupError):
         raise ProbeFailure('E_SANDBOX_UNVERIFIED')from None
     except PermissionError:
@@ -109,45 +139,50 @@ DISABLED_SANDBOX_FLAGS=frozenset({
 
 
 async def cdp_inventory(instances,counts):
-    """CDP establishes process roles, never proves their kernel restrictions."""
+    """Only query process roles. Never request Browser.getBrowserCommandLine."""
     inventories=[];all_ids=set()
     for instance in instances:
         session=None
         try:
-            session=await asyncio.wait_for(instance.browser.new_browser_cdp_session(),1)
-            info=await asyncio.wait_for(session.send('SystemInfo.getProcessInfo'),1)
-            command=await asyncio.wait_for(session.send('Browser.getBrowserCommandLine'),1)
-            rows=info['processInfo'];args=command['arguments']
-            if not isinstance(rows,list)or len(rows)>4096:
-                counts['cdp_rows_truncated']=int(isinstance(rows,list)and len(rows)>4096)
-                raise ValueError()
-            if not isinstance(args,list)or not args or len(args)>4096 or any(
-                not isinstance(arg,str)or len(arg)>65536 for arg in args):raise ValueError()
-            disabled=any(arg.split('=',1)[0]in DISABLED_SANDBOX_FLAGS for arg in args)
-            counts['sandbox_disabled']=int(disabled)
-            if disabled:raise ProbeFailure('E_SANDBOX_DISABLED')
-            browser=[];renderers=[]
-            for row in rows:
-                if not isinstance(row,dict):raise ValueError()
-                if row.get('type')not in ('browser','renderer'):continue
-                pid=row.get('id')
-                if type(pid)is not int or pid<=0:raise ValueError()
-                (browser if row['type']=='browser'else renderers).append(pid)
-            if len(browser)!=1 or not renderers:raise ProbeFailure('E_SANDBOX_UNVERIFIED')
-            ids=browser+renderers
-            if len(set(ids))!=len(ids)or all_ids.intersection(ids):raise ValueError()
+            try:session=await asyncio.wait_for(instance.browser.new_browser_cdp_session(),1)
+            except Exception:
+                counts['cdp_session_failed']=counts.get('cdp_session_failed',0)+1
+                raise ProbeFailure('E_SANDBOX_CDP_SESSION')from None
+            try:info=await asyncio.wait_for(session.send('SystemInfo.getProcessInfo'),1)
+            except Exception:
+                counts['cdp_process_query_failed']=counts.get('cdp_process_query_failed',0)+1
+                raise ProbeFailure('E_SANDBOX_CDP_PROCESS_QUERY')from None
+            try:
+                rows=info['processInfo']
+                if not isinstance(rows,list)or len(rows)>4096:
+                    counts['cdp_rows_truncated']=int(isinstance(rows,list)and len(rows)>4096)
+                    raise ValueError()
+                browser=[];renderers=[]
+                for row in rows:
+                    if not isinstance(row,dict):raise ValueError()
+                    if row.get('type')not in ('browser','renderer'):continue
+                    pid=row.get('id')
+                    if type(pid)is not int or pid<=0:raise ValueError()
+                    (browser if row['type']=='browser'else renderers).append(pid)
+                if len(browser)!=1 or not renderers:
+                    counts['cdp_process_missing']=counts.get('cdp_process_missing',0)+1
+                    raise ProbeFailure('E_SANDBOX_UNVERIFIED')
+                ids=browser+renderers
+                if len(set(ids))!=len(ids)or all_ids.intersection(ids):raise ValueError()
+            except (TypeError,KeyError,ValueError):
+                counts['cdp_process_invalid']=counts.get('cdp_process_invalid',0)+1
+                raise ProbeFailure('E_SANDBOX_CDP_PROCESS_INVALID')from None
             all_ids.update(ids)
-            inventories.append((browser[0],tuple(sorted(renderers)),tuple(args)))
+            inventories.append((browser[0],tuple(sorted(renderers))))
             counts['cdp_queries_ok']=counts.get('cdp_queries_ok',0)+1
             counts['cdp_renderer_ids']=counts.get('cdp_renderer_ids',0)+len(renderers)
-        except ProbeFailure:raise
-        except Exception:
+        except ProbeFailure:
             counts['cdp_queries_failed']=counts.get('cdp_queries_failed',0)+1
-            raise ProbeFailure('E_SANDBOX_CDP_INVALID')from None
+            raise
         finally:
             if session is not None:
                 try:await asyncio.wait_for(session.detach(),.2)
-                except Exception:pass
+                except Exception:counts['cdp_detach_failed']=counts.get('cdp_detach_failed',0)+1
     if not inventories:raise ProbeFailure('E_SANDBOX_UNVERIFIED')
     return inventories
 
@@ -193,12 +228,13 @@ def kernel_verification(inventories,records,counts):
         check(value['uid']==(os.geteuid(),)*4,'E_SANDBOX_IDENTITY')
         evidence[pid]=value
         return value
-    for browser_id,renderer_ids,args in inventories:
+    for browser_id,renderer_ids in inventories:
         browser=mapped(browser_id)
         check(browser['pid']in children and len(browser['nspid'])==index+1 and
               browser['namespaces']['pid']==own['namespaces']['pid'],'E_SANDBOX_IDENTITY')
-        executable=trusted_executable(args[0])
-        check(browser['exe']==executable,'E_SANDBOX_IDENTITY')
+        browser=process_evidence(browser['pid'],browser_expected=browser,counts=counts)
+        evidence[browser['pid']]=browser
+        executable=browser['exe']
         for renderer_id in renderer_ids:
             renderer=mapped(renderer_id)
             counts['cdp_renderer_visible']=counts.get('cdp_renderer_visible',0)+1
@@ -230,10 +266,12 @@ async def verify_sandbox(instances):
             inventories=await cdp_inventory(instances,counts)
             evidence,observed=kernel_verification(inventories,records,counts)
             # Independent repeat proves stable CDP role association and kernel identity.
-            if await cdp_inventory(instances,{})!=inventories:
+            if await cdp_inventory(instances,counts)!=inventories:
                 raise ProbeFailure('E_SANDBOX_UNVERIFIED')
             for pid,expected in evidence.items():
-                if process_evidence(pid)!=expected:raise ProbeFailure('E_SANDBOX_IDENTITY')
+                identity={k:v for k,v in expected.items()if k!='arguments'}
+                actual=process_evidence(pid,browser_expected=identity,counts=counts)if 'arguments'in expected else process_evidence(pid)
+                if actual!=expected:raise ProbeFailure('E_SANDBOX_IDENTITY')
             return observed,safe_counts(counts)
         except ProbeFailure as exc:
             if str(exc)=='E_SANDBOX_UNVERIFIED'and attempt<4:
