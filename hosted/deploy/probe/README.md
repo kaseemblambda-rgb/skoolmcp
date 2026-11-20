@@ -18,7 +18,7 @@ The revised hosted-only release gate is separate:
 python -I hosted/deploy/run_release_tests.py
 ```
 
-It requires 98 tests with no failures, errors or skips. It explicitly rejects
+It requires 107 tests with no failures, errors or skips. It explicitly rejects
 hosted/runtime/test imports from another checkout, including editable-install
 fallbacks. test-gate.json names the exact modules. Fixtures are in-memory helpers
 in test_hosted_popup.py and test_hosted_analytics.py; no member exports or saved
@@ -83,6 +83,15 @@ NoNewPrivs, seccomp filtering, zero effective capabilities and no --no-sandbox.
 They verify process/directory cleanup. Unsupported or uninspectable sandbox state
 fails the probe rather than silently weakening it. Never add privileged mode,
 SYS_ADMIN, --no-sandbox or unconfined seccomp to get a pass.
+
+Sandbox discovery now takes at most four snapshots with three 250 ms waits.
+Observed unsafe settings fail immediately without retry. On success or sandbox
+failure, sandbox_counts reports fixed integer categories only: process/status
+visibility and read failures, descendant/renderer matches, confirmed security
+fields and local CDP renderer visibility. CDP metadata can diagnose a missing
+renderer but cannot authorize a pass. Its requests and detach have timeouts.
+Raw process arguments, IDs, status records, cookies and CDP responses never leave
+the quiet diagnostic boundary. Failure still exits before starting the listener.
 
 On PASS, only /healthz and /result are exposed, with fixed check names and boolean
 flags. MCP and /job are never mounted on the listener. On failure, output is a

@@ -10,7 +10,7 @@ The active Mac exporter, its restricted role, monitoring and schedules are uncha
 
 This isolated synthetic-test release excludes all migration and Mac-operation
 files. Its proposed manifest has 53 paths and its reproducible hosted-only gate
-requires 98 passing tests, with imports restricted to this release. This replaces
+requires 107 passing tests, with imports restricted to this release. This replaces
 the earlier mixed 214-test gate; it does not claim that Mac-only tests run here.
 
 ## Workspace and services

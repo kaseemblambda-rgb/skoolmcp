@@ -8,7 +8,7 @@ import os
 import re
 import sys
 
-from .common import ProbeFailure,clean_environment,require,offline
+from .common import ProbeFailure,clean_environment,require,offline,safe_counts
 
 
 @contextmanager
@@ -35,12 +35,15 @@ def run(mode,live_browser=False,container=False):
     if mode in ('gateway','all'):
         from .gateway import check_gateway
         checks+=asyncio.run(check_gateway())
+    diagnostics={}
     if mode in ('browser','all'):
         from .browser import check_fake_browser,check_browser
         checks+=asyncio.run(check_fake_browser())
-        if live_browser:checks+=asyncio.run(check_browser(True))
-    return dict(result='PASS',mode=mode,container_runtime_checked=container,
+        if live_browser:checks+=asyncio.run(check_browser(True,diagnostics))
+    report=dict(result='PASS',mode=mode,container_runtime_checked=container,
         real_chromium_checked=live_browser,checks=checks)
+    if diagnostics:report['sandbox_counts']=safe_counts(diagnostics)
+    return report
 
 
 def serve(report,private=False):
@@ -75,7 +78,10 @@ def main(argv=None):
     except Exception as exc:
         code=str(exc)if isinstance(exc,ProbeFailure)else'E_PROBE_FAILED'
         if not re.fullmatch(r'E_[A-Z_]{1,64}',code):code='E_PROBE_FAILED'
-        print(json.dumps({'result':'FAIL','code':code},sort_keys=True),flush=True)
+        report={'result':'FAIL','code':code}
+        counts=safe_counts(exc.counts)if isinstance(exc,ProbeFailure)else{}
+        if counts:report['sandbox_counts']=counts
+        print(json.dumps(report,sort_keys=True),flush=True)
         return 1
     print(json.dumps(report,sort_keys=True),flush=True)
     if args.serve:

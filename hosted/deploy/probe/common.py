@@ -7,8 +7,28 @@ import socket
 from unittest.mock import patch
 
 
+SANDBOX_COUNTS=frozenset({
+    'scan_attempts','proc_entries','proc_listing_failed','proc_scan_truncated',
+    'status_readable','status_denied','status_disappeared','status_invalid',
+    'self_status_present','parentless_statuses','descendants','cmdline_readable',
+    'cmdline_denied','cmdline_disappeared','renderer_matches','sandbox_disabled',
+    'no_new_privs_confirmed','seccomp_filter_confirmed','zero_caps_confirmed',
+    'security_fields_missing','cdp_queries_ok','cdp_queries_failed','cdp_rows_truncated',
+    'cdp_renderer_ids','cdp_renderer_visible','cdp_renderer_descendants',
+})
+
+
+def safe_counts(values):
+    """Only fixed counter names and bounded integers can leave the quiet boundary."""
+    if not isinstance(values,dict):return {}
+    return {key:value for key,value in values.items()
+            if key in SANDBOX_COUNTS and type(value)is int and 0<=value<=1_000_000}
+
+
 class ProbeFailure(Exception):
-    pass
+    def __init__(self,code,counts=None):
+        super().__init__(code)
+        self.counts=safe_counts(counts)
 
 
 def require(value,code):

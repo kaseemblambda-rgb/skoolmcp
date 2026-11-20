@@ -6,7 +6,7 @@ from pathlib import Path
 import secrets
 
 from catknows.hosted_browser_service import build_browser_app,LoginBrowser
-from .common import require,request,offline
+from .common import require,request,offline,ProbeFailure,safe_counts
 
 
 class FakeBrowser:
@@ -18,13 +18,35 @@ class FakeBrowser:
     async def close(self):self.closed=True
 
 
-def descendants():
-    records={}
-    for path in Path('/proc').glob('[0-9]*/status'):
-        try:
-            fields=dict(line.split(':',1)for line in path.read_text().splitlines()if ':' in line)
-            records[int(path.parent.name)]=(int(fields['PPid']),fields,path.parent)
-        except (OSError,ValueError,KeyError):pass
+def process_snapshot():
+    """Inspect status metadata only; raw fields/IDs never enter result payloads."""
+    records={};counts=dict(proc_entries=0,proc_listing_failed=0,proc_scan_truncated=0,
+        status_readable=0,status_denied=0,status_disappeared=0,status_invalid=0,
+        self_status_present=0,parentless_statuses=0)
+    try:
+        paths=Path('/proc').iterdir()
+        for root in paths:
+            if not root.name.isdecimal():continue
+            if counts['proc_entries']>=4096:
+                counts['proc_scan_truncated']=1;break
+            counts['proc_entries']+=1
+            try:
+                fields=dict(line.split(':',1)for line in (root/'status').read_text().splitlines()if ':' in line)
+                parent=int(fields['PPid']);pid=int(root.name)
+                if parent<0:raise ValueError()
+                records[pid]=(parent,fields,root)
+                counts['status_readable']+=1
+                counts['self_status_present']+=int(pid==os.getpid())
+                counts['parentless_statuses']+=int(parent==0)
+            except PermissionError:counts['status_denied']+=1
+            except (FileNotFoundError,ProcessLookupError):counts['status_disappeared']+=1
+            except (OSError,UnicodeError,ValueError,KeyError):counts['status_invalid']+=1
+    except OSError:counts['proc_listing_failed']=1
+    return records,counts
+
+
+def descendants(records=None):
+    if records is None:records,_=process_snapshot()
     own=set();changed=True
     while changed:
         changed=False
@@ -33,22 +55,87 @@ def descendants():
     return {pid:records[pid]for pid in own}
 
 
-def sandbox_check():
-    children=descendants();renderers=[]
+def sandbox_check(records=None,counts=None):
+    if records is None:records,counts=process_snapshot()
+    counts=dict(counts or {})
+    children=descendants(records);renderers=[]
+    counts.update(descendants=len(children),cmdline_readable=0,cmdline_denied=0,
+        cmdline_disappeared=0,renderer_matches=0,sandbox_disabled=0,
+        no_new_privs_confirmed=0,seccomp_filter_confirmed=0,zero_caps_confirmed=0,security_fields_missing=0)
+    def check(value,code):
+        if not value:raise ProbeFailure(code,counts)
+    check(not counts.get('proc_scan_truncated'),'E_SANDBOX_UNVERIFIED')
     for pid,(_,fields,root)in children.items():
-        try:args=(root/'cmdline').read_bytes().split(b'\0')
-        except OSError:continue
+        try:
+            args=(root/'cmdline').read_bytes().split(b'\0')
+            counts['cmdline_readable']+=1
+        except (FileNotFoundError,ProcessLookupError):
+            counts['cmdline_disappeared']+=1;continue
+        except OSError:
+            counts['cmdline_denied']+=1;continue
         if b'--type=renderer' in args:
-            require(b'--no-sandbox' not in args,'E_SANDBOX_DISABLED')
-            require(fields.get('NoNewPrivs','').strip()=='1','E_SANDBOX_PRIVILEGES')
-            require(fields.get('Seccomp','').strip()=='2','E_SANDBOX_SECCOMP')
-            require(int(fields.get('CapEff','1'),16)==0,'E_SANDBOX_CAPABILITIES')
+            counts['renderer_matches']+=1
+            counts['sandbox_disabled']+=int(b'--no-sandbox'in args)
+            counts['no_new_privs_confirmed']+=int(fields.get('NoNewPrivs','').strip()=='1')
+            counts['seccomp_filter_confirmed']+=int(fields.get('Seccomp','').strip()=='2')
+            try:caps=int(fields.get('CapEff',''),16)
+            except ValueError:caps=None
+            counts['zero_caps_confirmed']+=int(caps==0)
+            counts['security_fields_missing']+=int(not all(fields.get(k,'').strip()for k in ('NoNewPrivs','Seccomp','CapEff')))
+            check(b'--no-sandbox'not in args,'E_SANDBOX_DISABLED')
+            check(fields.get('NoNewPrivs','').strip()=='1','E_SANDBOX_PRIVILEGES')
+            check(fields.get('Seccomp','').strip()=='2','E_SANDBOX_SECCOMP')
+            check(caps==0,'E_SANDBOX_CAPABILITIES')
             renderers.append(pid)
-    require(bool(renderers),'E_SANDBOX_UNVERIFIED')
-    return set(children)
+    check(bool(renderers),'E_SANDBOX_UNVERIFIED')
+    return set(children),safe_counts(counts)
 
 
-async def check_browser(live=False):
+async def cdp_process_counts(instances,records,children):
+    """Read browser process metadata only. It can diagnose, never authorize a pass."""
+    counts=dict(cdp_queries_ok=0,cdp_queries_failed=0,cdp_rows_truncated=0)
+    renderers=set()
+    for instance in instances:
+        session=None
+        try:
+            session=await asyncio.wait_for(instance.browser.new_browser_cdp_session(),1)
+            info=await asyncio.wait_for(session.send('SystemInfo.getProcessInfo'),1)
+            rows=info.get('processInfo',[])
+            if not isinstance(rows,list):raise ValueError()
+            counts['cdp_rows_truncated']+=int(len(rows)>4096)
+            for row in rows[:4096]:
+                if isinstance(row,dict)and row.get('type')=='renderer':
+                    pid=row.get('id')
+                    if type(pid)is int and pid>0:renderers.add(pid)
+            counts['cdp_queries_ok']+=1
+        except Exception:counts['cdp_queries_failed']+=1
+        finally:
+            if session is not None:
+                try:await asyncio.wait_for(session.detach(),.2)
+                except Exception:pass
+    counts.update(cdp_renderer_ids=len(renderers),cdp_renderer_visible=len(renderers&set(records)),
+                  cdp_renderer_descendants=len(renderers&set(children)))
+    return counts
+
+
+async def verify_sandbox(instances):
+    # Retry discovery only, at most four snapshots and three 250 ms waits.
+    # An observed unsafe renderer fails immediately, without a retry/fallback.
+    for attempt in range(1,5):
+        records,counts=process_snapshot();counts['scan_attempts']=attempt
+        try:
+            observed,counts=sandbox_check(records,counts)
+            counts.update(await cdp_process_counts(instances,records,observed))
+            return observed,safe_counts(counts)
+        except ProbeFailure as exc:
+            if str(exc)=='E_SANDBOX_UNVERIFIED'and attempt<4:
+                await asyncio.sleep(.25);continue
+            counts=exc.counts
+            counts.update(await cdp_process_counts(instances,records,descendants(records)))
+            raise ProbeFailure(str(exc),counts)from None
+
+
+async def check_browser(live=False,diagnostics=None):
     instances=[];observed=set();secret=secrets.token_urlsafe(32)
     def factory():
         browser=LoginBrowser()if live else FakeBrowser();instances.append(browser);return browser
@@ -71,7 +158,8 @@ async def check_browser(live=False):
             await a.context.add_cookies([{'name':'probe_isolation','value':'synthetic-only','url':'https://www.skool.com/'}])
             require(not any(c['name']in('probe_isolation','auth_token')for c in await b.context.cookies()),'E_BROWSER_COOKIE_LEAK')
             require(not any(c['name']=='auth_token'for c in await a.context.cookies()),'E_BROWSER_UNEXPECTED_LOGIN')
-            observed=sandbox_check()
+            observed,counts=await verify_sandbox(instances)
+            if diagnostics is not None:diagnostics.update(safe_counts(counts))
         frames=[await job('command',i,{'type':'frame'})for i in (1,2)]
         require(all(status==200 and 'frame'in body and 'session'not in body for status,body in frames),'E_BROWSER_FRAME')
         if not live:require(frames[0][1]['marker']!=frames[1][1]['marker'],'E_BROWSER_FAKE_ISOLATION')
