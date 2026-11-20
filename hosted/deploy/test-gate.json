@@ -1,0 +1,19 @@
+{
+  "modules": [
+    "test_hosted_container_probe",
+    "test_hosted_deployment",
+    "test_hosted_private_tls",
+    "test_hosted",
+    "test_hosted_1b",
+    "test_hosted_step2",
+    "test_hosted_popup",
+    "test_hosted_security",
+    "test_hosted_analytics",
+    "test_hosted_activity",
+    "test_hosted_login",
+    "test_hosted_release_scope"
+  ],
+  "scope": "Hosted runtime and synthetic container checks only. Mac exporter, scheduler, reconciliation and updater suites are excluded.",
+  "expected_tests": 98,
+  "allow_skips": false
+}
