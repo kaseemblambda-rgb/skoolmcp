@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
 
 from catknows.hosted_browser_service import build_browser_app,LoginBrowser
 from .common import require,request,offline,ProbeFailure,safe_counts
@@ -45,93 +46,198 @@ def process_snapshot():
     return records,counts
 
 
-def descendants(records=None):
+def descendants(records=None,root_pid=None):
     if records is None:records,_=process_snapshot()
     own=set();changed=True
     while changed:
         changed=False
         for pid,(parent,_,_)in records.items():
-            if pid not in own and (parent==os.getpid()or parent in own):own.add(pid);changed=True
+            if pid not in own and (parent==(os.getpid()if root_pid is None else root_pid)or parent in own):own.add(pid);changed=True
     return {pid:records[pid]for pid in own}
 
 
-def sandbox_check(records=None,counts=None):
-    if records is None:records,counts=process_snapshot()
-    counts=dict(counts or {})
-    children=descendants(records);renderers=[]
-    counts.update(descendants=len(children),cmdline_readable=0,cmdline_denied=0,
-        cmdline_disappeared=0,renderer_matches=0,sandbox_disabled=0,
-        no_new_privs_confirmed=0,seccomp_filter_confirmed=0,zero_caps_confirmed=0,security_fields_missing=0)
-    def check(value,code):
-        if not value:raise ProbeFailure(code,counts)
-    check(not counts.get('proc_scan_truncated'),'E_SANDBOX_UNVERIFIED')
-    for pid,(_,fields,root)in children.items():
-        try:
-            args=(root/'cmdline').read_bytes().split(b'\0')
-            counts['cmdline_readable']+=1
-        except (FileNotFoundError,ProcessLookupError):
-            counts['cmdline_disappeared']+=1;continue
-        except OSError:
-            counts['cmdline_denied']+=1;continue
-        if b'--type=renderer' in args:
-            counts['renderer_matches']+=1
-            counts['sandbox_disabled']+=int(b'--no-sandbox'in args)
-            counts['no_new_privs_confirmed']+=int(fields.get('NoNewPrivs','').strip()=='1')
-            counts['seccomp_filter_confirmed']+=int(fields.get('Seccomp','').strip()=='2')
-            try:caps=int(fields.get('CapEff',''),16)
-            except ValueError:caps=None
-            counts['zero_caps_confirmed']+=int(caps==0)
-            counts['security_fields_missing']+=int(not all(fields.get(k,'').strip()for k in ('NoNewPrivs','Seccomp','CapEff')))
-            check(b'--no-sandbox'not in args,'E_SANDBOX_DISABLED')
-            check(fields.get('NoNewPrivs','').strip()=='1','E_SANDBOX_PRIVILEGES')
-            check(fields.get('Seccomp','').strip()=='2','E_SANDBOX_SECCOMP')
-            check(caps==0,'E_SANDBOX_CAPABILITIES')
-            renderers.append(pid)
-    check(bool(renderers),'E_SANDBOX_UNVERIFIED')
-    return set(children),safe_counts(counts)
+def process_evidence(pid,proc=Path('/proc')):
+    """Pin a proc directory, read bounded kernel evidence, detect exit/PID reuse.
+
+    Internal return values contain identifiers. Only safe_counts may be emitted.
+    No cmdline, environment, page contents or cookies are read here.
+    """
+    fd=None
+    try:
+        fd=os.open(proc/str(pid),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        def read(name):
+            child=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd)
+            with os.fdopen(child,'r')as stream:value=stream.read(65537)
+            if len(value)>65536:raise ValueError()
+            return value
+        def start(value):
+            prefix,tail=value.rsplit(')',1)
+            if int(prefix.split('(',1)[0])!=pid:raise ValueError()
+            result=int(tail.split()[19])
+            if result<0:raise ValueError()
+            return result
+        first=start(read('stat'))
+        fields=dict(line.split(':',1)for line in read('status').splitlines()if ':'in line)
+        if int(fields['Pid'])!=pid:raise ValueError()
+        nspid=tuple(map(int,fields['NSpid'].split()))
+        uid=tuple(map(int,fields['Uid'].split()))
+        if not nspid or nspid[0]!=pid or min(nspid)<=0 or len(uid)!=4:raise ValueError()
+        exe=os.stat('exe',dir_fd=fd)
+        namespaces={name:(value.st_dev,value.st_ino)for name in ('pid','net','user')
+                    for value in [os.stat('ns/'+name,dir_fd=fd)]}
+        security={name:int(fields[name],16 if name=='CapEff'else 10)
+                  for name in ('NoNewPrivs','Seccomp','CapEff','Seccomp_filters')}
+        if min(security.values())<0:raise ValueError()
+        if start(read('stat'))!=first:raise ValueError()
+        return dict(pid=pid,nspid=nspid,uid=uid,start=first,exe=(exe.st_dev,exe.st_ino),
+                    namespaces=namespaces,**security)
+    except (FileNotFoundError,ProcessLookupError):
+        raise ProbeFailure('E_SANDBOX_UNVERIFIED')from None
+    except PermissionError:
+        raise ProbeFailure('E_SANDBOX_EVIDENCE_DENIED')from None
+    except (OSError,ValueError,KeyError,IndexError,UnicodeError):
+        raise ProbeFailure('E_SANDBOX_EVIDENCE_INVALID')from None
+    finally:
+        if fd is not None:os.close(fd)
 
 
-async def cdp_process_counts(instances,records,children):
-    """Read browser process metadata only. It can diagnose, never authorize a pass."""
-    counts=dict(cdp_queries_ok=0,cdp_queries_failed=0,cdp_rows_truncated=0)
-    renderers=set()
+DISABLED_SANDBOX_FLAGS=frozenset({
+    '--no-sandbox','--disable-seccomp-filter-sandbox','--disable-namespace-sandbox',
+    '--disable-setuid-sandbox','--disable-gpu-sandbox','--single-process','--no-zygote',
+    '--allow-sandbox-debugging','--in-process-gpu',
+})
+
+
+async def cdp_inventory(instances,counts):
+    """CDP establishes process roles, never proves their kernel restrictions."""
+    inventories=[];all_ids=set()
     for instance in instances:
         session=None
         try:
             session=await asyncio.wait_for(instance.browser.new_browser_cdp_session(),1)
             info=await asyncio.wait_for(session.send('SystemInfo.getProcessInfo'),1)
-            rows=info.get('processInfo',[])
-            if not isinstance(rows,list):raise ValueError()
-            counts['cdp_rows_truncated']+=int(len(rows)>4096)
-            for row in rows[:4096]:
-                if isinstance(row,dict)and row.get('type')=='renderer':
-                    pid=row.get('id')
-                    if type(pid)is int and pid>0:renderers.add(pid)
-            counts['cdp_queries_ok']+=1
-        except Exception:counts['cdp_queries_failed']+=1
+            command=await asyncio.wait_for(session.send('Browser.getBrowserCommandLine'),1)
+            rows=info['processInfo'];args=command['arguments']
+            if not isinstance(rows,list)or len(rows)>4096:
+                counts['cdp_rows_truncated']=int(isinstance(rows,list)and len(rows)>4096)
+                raise ValueError()
+            if not isinstance(args,list)or not args or len(args)>4096 or any(
+                not isinstance(arg,str)or len(arg)>65536 for arg in args):raise ValueError()
+            disabled=any(arg.split('=',1)[0]in DISABLED_SANDBOX_FLAGS for arg in args)
+            counts['sandbox_disabled']=int(disabled)
+            if disabled:raise ProbeFailure('E_SANDBOX_DISABLED')
+            browser=[];renderers=[]
+            for row in rows:
+                if not isinstance(row,dict):raise ValueError()
+                if row.get('type')not in ('browser','renderer'):continue
+                pid=row.get('id')
+                if type(pid)is not int or pid<=0:raise ValueError()
+                (browser if row['type']=='browser'else renderers).append(pid)
+            if len(browser)!=1 or not renderers:raise ProbeFailure('E_SANDBOX_UNVERIFIED')
+            ids=browser+renderers
+            if len(set(ids))!=len(ids)or all_ids.intersection(ids):raise ValueError()
+            all_ids.update(ids)
+            inventories.append((browser[0],tuple(sorted(renderers)),tuple(args)))
+            counts['cdp_queries_ok']=counts.get('cdp_queries_ok',0)+1
+            counts['cdp_renderer_ids']=counts.get('cdp_renderer_ids',0)+len(renderers)
+        except ProbeFailure:raise
+        except Exception:
+            counts['cdp_queries_failed']=counts.get('cdp_queries_failed',0)+1
+            raise ProbeFailure('E_SANDBOX_CDP_INVALID')from None
         finally:
             if session is not None:
                 try:await asyncio.wait_for(session.detach(),.2)
                 except Exception:pass
-    counts.update(cdp_renderer_ids=len(renderers),cdp_renderer_visible=len(renderers&set(records)),
-                  cdp_renderer_descendants=len(renderers&set(children)))
-    return counts
+    if not inventories:raise ProbeFailure('E_SANDBOX_UNVERIFIED')
+    return inventories
+
+
+def trusted_executable(argument):
+    """Only the immutable, root-installed Playwright binary can establish identity."""
+    try:
+        path=Path(argument)
+        if not path.is_absolute():raise ValueError()
+        path=path.resolve(strict=True)
+        if not path.is_relative_to('/opt/playwright'):raise ValueError()
+        for item in (path,*path.parents):
+            value=item.stat()
+            if value.st_uid!=0 or value.st_mode&0o022:raise ValueError()
+        value=path.stat()
+        if not stat.S_ISREG(value.st_mode)or not value.st_mode&0o111:raise ValueError()
+        return value.st_dev,value.st_ino
+    except (OSError,ValueError):raise ProbeFailure('E_SANDBOX_IDENTITY')from None
+
+
+def kernel_verification(inventories,records,counts):
+    """Map browser-namespace CDP IDs to procfs IDs via NSpid, without argv roles."""
+    def check(value,code):
+        if not value:raise ProbeFailure(code)
+    try:self_pid=int(os.readlink('/proc/self'))
+    except (OSError,ValueError):raise ProbeFailure('E_SANDBOX_IDENTITY')from None
+    own=process_evidence(self_pid);index=len(own['nspid'])-1
+    check(own['nspid'][-1]==os.getpid(),'E_SANDBOX_IDENTITY')
+    children=descendants(records,self_pid)
+    counts['descendants']=len(children)
+    evidence={self_pid:own};used=set()
+    def mapped(cdp_pid):
+        candidates=[]
+        for pid,(_,fields,_)in records.items():
+            try:ids=tuple(map(int,fields.get('NSpid','').split()))
+            except ValueError:continue
+            if len(ids)>index and ids[index]==cdp_pid:candidates.append(pid)
+        check(len(candidates)==1,'E_SANDBOX_UNVERIFIED')
+        pid=candidates[0]
+        check(pid not in used,'E_SANDBOX_IDENTITY');used.add(pid)
+        value=process_evidence(pid)
+        check(len(value['nspid'])>index and value['nspid'][index]==cdp_pid,'E_SANDBOX_IDENTITY')
+        check(value['uid']==(os.geteuid(),)*4,'E_SANDBOX_IDENTITY')
+        evidence[pid]=value
+        return value
+    for browser_id,renderer_ids,args in inventories:
+        browser=mapped(browser_id)
+        check(browser['pid']in children and len(browser['nspid'])==index+1 and
+              browser['namespaces']['pid']==own['namespaces']['pid'],'E_SANDBOX_IDENTITY')
+        executable=trusted_executable(args[0])
+        check(browser['exe']==executable,'E_SANDBOX_IDENTITY')
+        for renderer_id in renderer_ids:
+            renderer=mapped(renderer_id)
+            counts['cdp_renderer_visible']=counts.get('cdp_renderer_visible',0)+1
+            counts['cdp_renderer_descendants']=counts.get('cdp_renderer_descendants',0)+int(renderer['pid']in children)
+            check(renderer['exe']==executable,'E_SANDBOX_IDENTITY')
+            for field,expected,code,counter in (
+                ('NoNewPrivs',1,'E_SANDBOX_PRIVILEGES','no_new_privs_confirmed'),
+                ('Seccomp',2,'E_SANDBOX_SECCOMP','seccomp_filter_confirmed'),
+                ('CapEff',0,'E_SANDBOX_CAPABILITIES','zero_caps_confirmed')):
+                check(renderer[field]==expected,code)
+                counts[counter]=counts.get(counter,0)+1
+            check(renderer['Seccomp_filters']>browser['Seccomp_filters'],'E_SANDBOX_INHERITED_SECCOMP')
+            counts['extra_seccomp_filter_confirmed']=counts.get('extra_seccomp_filter_confirmed',0)+1
+            check(len(renderer['nspid'])>len(browser['nspid'])and all(
+                renderer['namespaces'][name]!=browser['namespaces'][name]for name in ('pid','net')),
+                'E_SANDBOX_NAMESPACES')
+            counts['namespace_confirmed']=counts.get('namespace_confirmed',0)+1
+            counts['renderer_evidence_confirmed']=counts.get('renderer_evidence_confirmed',0)+1
+    return evidence,set(children)|used
 
 
 async def verify_sandbox(instances):
-    # Retry discovery only, at most four snapshots and three 250 ms waits.
-    # An observed unsafe renderer fails immediately, without a retry/fallback.
+    # Bounded retry only for discovery/exit races. Unsafe/unreadable evidence fails.
     for attempt in range(1,5):
         records,counts=process_snapshot();counts['scan_attempts']=attempt
         try:
-            observed,counts=sandbox_check(records,counts)
-            counts.update(await cdp_process_counts(instances,records,observed))
+            if counts.get('proc_listing_failed')or counts.get('proc_scan_truncated'):
+                raise ProbeFailure('E_SANDBOX_UNVERIFIED')
+            inventories=await cdp_inventory(instances,counts)
+            evidence,observed=kernel_verification(inventories,records,counts)
+            # Independent repeat proves stable CDP role association and kernel identity.
+            if await cdp_inventory(instances,{})!=inventories:
+                raise ProbeFailure('E_SANDBOX_UNVERIFIED')
+            for pid,expected in evidence.items():
+                if process_evidence(pid)!=expected:raise ProbeFailure('E_SANDBOX_IDENTITY')
             return observed,safe_counts(counts)
         except ProbeFailure as exc:
             if str(exc)=='E_SANDBOX_UNVERIFIED'and attempt<4:
                 await asyncio.sleep(.25);continue
-            counts=exc.counts
-            counts.update(await cdp_process_counts(instances,records,descendants(records)))
             raise ProbeFailure(str(exc),counts)from None
 
 

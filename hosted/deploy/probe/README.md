@@ -18,7 +18,7 @@ The revised hosted-only release gate is separate:
 python -I hosted/deploy/run_release_tests.py
 ```
 
-It requires 107 tests with no failures, errors or skips. It explicitly rejects
+It requires 116 tests with no failures, errors or skips. It explicitly rejects
 hosted/runtime/test imports from another checkout, including editable-install
 fallbacks. test-gate.json names the exact modules. Fixtures are in-memory helpers
 in test_hosted_popup.py and test_hosted_analytics.py; no member exports or saved
@@ -78,20 +78,40 @@ are read. A harmless test cookie confirms context separation.
 The real-browser checks require two distinct browser/context/directory instances,
 deny a third simultaneous job, check frames without returning/logging screenshots,
 test one-job failure without disturbing the other, close jobs and clean up on app
-shutdown. They inspect only their own process descendants and require renderer
-NoNewPrivs, seccomp filtering, zero effective capabilities and no --no-sandbox.
-They verify process/directory cleanup. Unsupported or uninspectable sandbox state
-fails the probe rather than silently weakening it. Never add privileged mode,
-SYS_ADMIN, --no-sandbox or unconfined seccomp to get a pass.
+shutdown. CDP SystemInfo.getProcessInfo identifies every renderer of each owned
+browser, replacing the fragile renderer argv/parent-discovery heuristic. The probe
+maps CDP IDs through NSpid into the procfs namespace. The browser must remain a
+launcher descendant in the launcher's PID namespace. Renderers need not remain
+Python descendants, but each must map uniquely to its browser's CDP inventory.
 
-Sandbox discovery now takes at most four snapshots with three 250 ms waits.
-Observed unsafe settings fail immediately without retry. On success or sandbox
-failure, sandbox_counts reports fixed integer categories only: process/status
-visibility and read failures, descendant/renderer matches, confirmed security
-fields and local CDP renderer visibility. CDP metadata can diagnose a missing
-renderer but cannot authorize a pass. Its requests and detach have timeouts.
+Each process directory is pinned while bounded stat/status/executable/namespace
+reads run. The executable must match the root-owned, non-writable Playwright
+binary under /opt/playwright; UIDs, namespace mapping and process start times must
+match. A second CDP inventory and repeated kernel evidence must remain stable.
+No raw process argument is used to recognize renderer roles. Browser command
+arguments are inspected internally through CDP to reject sandbox-disabling flags;
+they are never printed. Unsupported CDP commands fail closed without adding flags.
+
+Every renderer must have NoNewPrivs=1, Seccomp=2, CapEff=0, nested PID and separate
+network namespaces. Seccomp_filters must exceed its browser process baseline,
+so the container's inherited filter alone cannot pass. Missing fields, unreadable
+/proc/exe/namespace evidence, ambiguous PID mapping or reused PIDs fail closed.
+In particular, Render denying these reads will fail the probe; this change does
+not grant ptrace, change dumpability or add capabilities to bypass that boundary.
+Never add privileged mode, SYS_ADMIN, --no-sandbox, --allow-sandbox-debugging or
+unconfined seccomp to get a pass. Production launch flags/images remain unchanged.
+
+Discovery/exit/inventory races take at most four snapshots with three 250 ms waits.
+Observed unsafe, unreadable or invalid security evidence fails immediately.
+On success or failure, sandbox_counts reports allowlisted integer categories only,
+including CDP renderer counts, namespace confirmations and extra-filter evidence.
+CDP alone cannot authorize a pass. CDP requests and detach have bounded timeouts.
 Raw process arguments, IDs, status records, cookies and CDP responses never leave
 the quiet diagnostic boundary. Failure still exits before starting the listener.
+
+Kernel field definitions: [proc_pid_status(5)](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html).
+CDP methods: [official protocol](https://chromedevtools.github.io/devtools-protocol/tot/SystemInfo/#method-getProcessInfo)
+and [Browser.getBrowserCommandLine](https://chromedevtools.github.io/devtools-protocol/tot/Browser/#method-getBrowserCommandLine).
 
 On PASS, only /healthz and /result are exposed, with fixed check names and boolean
 flags. MCP and /job are never mounted on the listener. On failure, output is a

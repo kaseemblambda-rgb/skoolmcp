@@ -14,6 +14,6 @@
     "test_hosted_release_scope"
   ],
   "scope": "Hosted runtime and synthetic container checks only. Mac exporter, scheduler, reconciliation and updater suites are excluded.",
-  "expected_tests": 107,
+  "expected_tests": 116,
   "allow_skips": false
 }

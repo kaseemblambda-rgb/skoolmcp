@@ -75,18 +75,6 @@ class ContainerProbeTests(unittest.TestCase):
         for name in ('catknows/hosted_server.py','catknows/hosted_browser_service.py'):
             self.assertNotIn('hosted_probe',(ROOT/name).read_text())
 
-    def test_sandbox_inspection_fails_closed_if_unverified(self):
-        from hosted.deploy.probe.browser import sandbox_check
-        with patch('hosted.deploy.probe.browser.descendants',return_value={}):
-            with self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_UNVERIFIED'):sandbox_check()
-
-    def renderer(self,fields=None,disabled=False):
-        root=MagicMock()
-        args=b'chrome\0--type=renderer\0synthetic-private-argument\0'
-        if disabled:args+=b'--no-sandbox\0'
-        root.__truediv__.return_value.read_bytes.return_value=args
-        return {20:(10,fields or dict(NoNewPrivs='1',Seccomp='2',CapEff='0'),root)}
-
     def test_proc_snapshot_reports_read_failures_as_counts_only(self):
         from hosted.deploy.probe.browser import process_snapshot
         roots=[]
@@ -105,57 +93,6 @@ class ContainerProbeTests(unittest.TestCase):
         self.assertEqual(counts['proc_entries'],4)
         self.assertNotIn('synthetic-sensitive',json.dumps(counts))
 
-    def test_verified_renderer_reports_counts_without_arguments_or_ids(self):
-        from hosted.deploy.probe.browser import sandbox_check
-        with patch('os.getpid',return_value=10):observed,counts=sandbox_check(self.renderer(),{'proc_entries':1})
-        self.assertEqual(observed,{20})
-        self.assertEqual(counts['renderer_matches'],1)
-        self.assertEqual(counts['no_new_privs_confirmed'],1)
-        self.assertEqual(counts['seccomp_filter_confirmed'],1)
-        self.assertEqual(counts['zero_caps_confirmed'],1)
-        self.assertNotIn('synthetic-private-argument',json.dumps(counts))
-        self.assertTrue(all(type(value)is int for value in counts.values()))
-
-    def test_unsafe_or_missing_security_fields_still_fail_closed(self):
-        from hosted.deploy.probe.browser import sandbox_check
-        cases=[({},True,'E_SANDBOX_DISABLED'),({'NoNewPrivs':'0','Seccomp':'2','CapEff':'0'},False,'E_SANDBOX_PRIVILEGES'),
-            ({'NoNewPrivs':'1','Seccomp':'0','CapEff':'0'},False,'E_SANDBOX_SECCOMP'),
-            ({'NoNewPrivs':'1','Seccomp':'2','CapEff':'1'},False,'E_SANDBOX_CAPABILITIES'),
-            ({'NoNewPrivs':'1','Seccomp':'2','CapEff':'invalid'},False,'E_SANDBOX_CAPABILITIES')]
-        for fields,disabled,code in cases:
-            with self.subTest(code=code),patch('os.getpid',return_value=10),self.assertRaisesRegex(ProbeFailure,code):
-                sandbox_check(self.renderer(fields,disabled),{})
-
-    def test_discovery_retries_are_bounded_and_never_pass_on_cdp_alone(self):
-        from hosted.deploy.probe.browser import verify_sandbox
-        with patch('hosted.deploy.probe.browser.process_snapshot',return_value=({},{}))as scan, \
-             patch('hosted.deploy.probe.browser.cdp_process_counts',new=AsyncMock(return_value={'cdp_renderer_ids':2})), \
-             patch('hosted.deploy.probe.browser.asyncio.sleep',new=AsyncMock())as sleep:
-            with self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_UNVERIFIED')as caught:asyncio.run(verify_sandbox([]))
-        self.assertEqual(scan.call_count,4);self.assertEqual(sleep.await_count,3)
-        self.assertTrue(all(call.args==(.25,)for call in sleep.await_args_list))
-        self.assertEqual(caught.exception.counts['scan_attempts'],4)
-        self.assertEqual(caught.exception.counts['cdp_renderer_ids'],2)
-
-    def test_late_renderer_must_satisfy_original_security_checks(self):
-        from hosted.deploy.probe.browser import verify_sandbox
-        with patch('os.getpid',return_value=10), \
-             patch('hosted.deploy.probe.browser.process_snapshot',side_effect=[({},{}),(self.renderer(),{})]), \
-             patch('hosted.deploy.probe.browser.cdp_process_counts',new=AsyncMock(return_value={})), \
-             patch('hosted.deploy.probe.browser.asyncio.sleep',new=AsyncMock())as sleep:
-            observed,counts=asyncio.run(verify_sandbox([]))
-        self.assertEqual(observed,{20});self.assertEqual(counts['scan_attempts'],2)
-        self.assertEqual(counts['renderer_matches'],1);sleep.assert_awaited_once_with(.25)
-
-    def test_observed_unsafe_renderer_is_not_retried(self):
-        from hosted.deploy.probe.browser import verify_sandbox
-        with patch('os.getpid',return_value=10), \
-             patch('hosted.deploy.probe.browser.process_snapshot',return_value=(self.renderer(disabled=True),{}))as scan, \
-             patch('hosted.deploy.probe.browser.cdp_process_counts',new=AsyncMock(return_value={})), \
-             patch('hosted.deploy.probe.browser.asyncio.sleep',new=AsyncMock())as sleep:
-            with self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_DISABLED'):asyncio.run(verify_sandbox([]))
-        self.assertEqual(scan.call_count,1);sleep.assert_not_awaited()
-
     def test_diagnostic_output_filters_sensitive_keys_values_and_still_exits(self):
         error=ProbeFailure('E_SANDBOX_UNVERIFIED',{'scan_attempts':4,'descendants':2,'cookies':'synthetic-sensitive',
             'proc_entries':True,'renderer_matches':-1,'pid':20})
@@ -167,25 +104,225 @@ class ContainerProbeTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue()),dict(result='FAIL',code='E_SANDBOX_UNVERIFIED',
             sandbox_counts=dict(scan_attempts=4,descendants=2)))
 
-    def test_cdp_diagnostics_expose_only_counts_and_not_process_metadata(self):
-        from hosted.deploy.probe.browser import cdp_process_counts
-        session=SimpleNamespace(send=AsyncMock(return_value={'processInfo':[
-            {'type':'renderer','id':20,'extra':'synthetic-sensitive'}, {'type':'renderer','id':30}]}),detach=AsyncMock())
-        good=SimpleNamespace(browser=SimpleNamespace(new_browser_cdp_session=AsyncMock(return_value=session)))
-        bad=SimpleNamespace(browser=SimpleNamespace(new_browser_cdp_session=AsyncMock(side_effect=RuntimeError('synthetic-sensitive'))))
-        counts=asyncio.run(cdp_process_counts([good,bad],{20:None},{20:None}))
-        self.assertEqual(counts,dict(cdp_queries_ok=1,cdp_queries_failed=1,cdp_rows_truncated=0,
-            cdp_renderer_ids=2,cdp_renderer_visible=1,cdp_renderer_descendants=1))
-        session.send.assert_awaited_once_with('SystemInfo.getProcessInfo');session.detach.assert_awaited_once()
-        self.assertNotIn('synthetic-sensitive',json.dumps(counts))
+    def fixture(self):
+        def evidence(pid,ids,namespace,renderer=False):
+            return dict(pid=pid,nspid=ids,uid=(10001,)*4,start=1000+pid,exe=(1,2),
+                namespaces=dict(pid=(1,namespace),net=(2,namespace),user=(3,1)),
+                NoNewPrivs=int(renderer),Seccomp=2,CapEff=0,Seccomp_filters=2 if renderer else 1)
+        values={100:evidence(100,(100,10),1),110:evidence(110,(110,11),1),
+                120:evidence(120,(120,12,1),2,True),210:evidence(210,(210,21),1),
+                220:evidence(220,(220,22,1),3,True)}
+        records={pid:(100 if pid in (110,210)else 0,{'NSpid':' '.join(map(str,v['nspid']))},None)
+                 for pid,v in values.items()}
+        inventories=[(11,(12,),('/opt/playwright/chrome',)),(21,(22,),('/opt/playwright/chrome',))]
+        return values,records,inventories
 
-    def test_unreadable_renderer_command_still_fails_with_category(self):
-        from hosted.deploy.probe.browser import sandbox_check
-        records=self.renderer();records[20][2].__truediv__.return_value.read_bytes.side_effect=PermissionError('synthetic-sensitive')
-        with patch('os.getpid',return_value=10),self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_UNVERIFIED')as caught:
-            sandbox_check(records,{})
-        self.assertEqual(caught.exception.counts['cmdline_denied'],1)
-        self.assertEqual(caught.exception.counts['renderer_matches'],0)
+    @contextlib.contextmanager
+    def kernel(self,values=None,records=None):
+        from hosted.deploy.probe import browser
+        default_values,default_records,_=self.fixture()
+        values=default_values if values is None else values
+        records=default_records if records is None else records
+        with patch.object(browser,'process_evidence',side_effect=lambda pid:values[pid]), \
+             patch.object(browser,'trusted_executable',return_value=(1,2)), \
+             patch.object(browser,'process_snapshot',return_value=(records,{})), \
+             patch.object(browser.os,'readlink',return_value='100'), \
+             patch.object(browser.os,'getpid',return_value=10),patch.object(browser.os,'geteuid',return_value=10001):
+            yield browser
+
+    def test_cdp_maps_every_renderer_without_argv_or_renderer_ancestry(self):
+        _,_,inventories=self.fixture();counts={}
+        with self.kernel()as browser:evidence,observed=browser.kernel_verification(inventories,self.fixture()[1],counts)
+        self.assertEqual(set(evidence),{100,110,120,210,220})
+        self.assertEqual(observed,{110,120,210,220})
+        self.assertEqual(counts['renderer_evidence_confirmed'],2)
+        self.assertEqual(counts['cdp_renderer_descendants'],0)
+        self.assertEqual(counts['extra_seccomp_filter_confirmed'],2)
+        self.assertEqual(counts['namespace_confirmed'],2)
+        self.assertTrue(all(type(value)is int for value in counts.values()))
+
+    def test_all_renderers_must_meet_kernel_restrictions(self):
+        cases=[('NoNewPrivs',0,'E_SANDBOX_PRIVILEGES'),('Seccomp',0,'E_SANDBOX_SECCOMP'),
+               ('CapEff',1,'E_SANDBOX_CAPABILITIES'),('Seccomp_filters',1,'E_SANDBOX_INHERITED_SECCOMP'),
+               ('Seccomp_filters',0,'E_SANDBOX_INHERITED_SECCOMP')]
+        for field,value,code in cases:
+            values,records,inventory=self.fixture();values[220][field]=value
+            with self.subTest(field=field,value=value),self.kernel(values)as browser, self.assertRaisesRegex(ProbeFailure,code):
+                browser.kernel_verification(inventory,records,{})
+
+    def test_renderer_identity_and_namespace_fail_closed(self):
+        for change,code in [('exe','E_SANDBOX_IDENTITY'),('uid','E_SANDBOX_IDENTITY'),
+                            ('pid','E_SANDBOX_NAMESPACES'),('net','E_SANDBOX_NAMESPACES'),
+                            ('depth','E_SANDBOX_NAMESPACES')]:
+            values,records,inventory=self.fixture()
+            if change in ('pid','net'):values[120]['namespaces'][change]=values[110]['namespaces'][change]
+            elif change=='depth':values[120]['nspid']=(120,12)
+            else:values[120][change]=(99,99)
+            with self.subTest(change=change),self.kernel(values)as browser,self.assertRaisesRegex(ProbeFailure,code):
+                browser.kernel_verification(inventory,records,{})
+
+    def test_browser_must_be_owned_and_in_launcher_namespace(self):
+        for change in ('parent','namespace','depth'):
+            values,records,inventory=self.fixture()
+            if change=='parent':records[110]=(0,records[110][1],None)
+            elif change=='namespace':values[110]['namespaces']['pid']=(99,99)
+            else:values[110]['nspid']=(110,11,1)
+            with self.subTest(change=change),self.kernel(values,records)as browser,self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_IDENTITY'):
+                browser.kernel_verification(inventory,records,{})
+
+    def test_missing_or_ambiguous_namespace_mapping_is_not_accepted(self):
+        for ambiguous in (False,True):
+            _,records,inventory=self.fixture()
+            if ambiguous:records[121]=(0,{'NSpid':'121 12 2'},None)
+            else:del records[120]
+            with self.subTest(ambiguous=ambiguous),self.kernel(records=records)as browser, self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_UNVERIFIED'):
+                browser.kernel_verification(inventory,records,{})
+
+    def instance(self,rows=None,args=None,error=None):
+        rows=rows if rows is not None else [{'type':'browser','id':11},{'type':'renderer','id':12}]
+        async def send(method):
+            if error:raise error
+            return {'processInfo':rows}if method=='SystemInfo.getProcessInfo'else {'arguments':args or ['/opt/playwright/chrome','synthetic-private-argument']}
+        session=SimpleNamespace(send=AsyncMock(side_effect=send),detach=AsyncMock())
+        return SimpleNamespace(browser=SimpleNamespace(new_browser_cdp_session=AsyncMock(return_value=session))),session
+
+    def test_cdp_inventory_reads_roles_and_command_without_logging_them(self):
+        from hosted.deploy.probe.browser import cdp_inventory
+        instance,session=self.instance();counts={}
+        result=asyncio.run(cdp_inventory([instance],counts))
+        self.assertEqual(result[0][:2],(11,(12,)))
+        self.assertEqual(counts,dict(sandbox_disabled=0,cdp_queries_ok=1,cdp_renderer_ids=1))
+        self.assertEqual([call.args[0]for call in session.send.await_args_list],
+                         ['SystemInfo.getProcessInfo','Browser.getBrowserCommandLine'])
+        session.detach.assert_awaited_once();self.assertNotIn('synthetic-private-argument',json.dumps(counts))
+
+    def test_cdp_malformed_duplicates_cross_browser_and_failures_are_denied(self):
+        from hosted.deploy.probe.browser import cdp_inventory
+        cases=[None,[],[{'type':'renderer','id':12}],
+               [{'type':'browser','id':True},{'type':'renderer','id':12}],
+               [{'type':'browser','id':11},{'type':'renderer','id':12},{'type':'renderer','id':12}],
+               [{'type':'browser','id':11}]*4097]
+        for rows in cases:
+            instance,_=self.instance(error=RuntimeError('synthetic-sensitive'))if rows is None else self.instance(rows=rows)
+            with self.subTest(rows_type=type(rows).__name__),self.assertRaises(ProbeFailure):asyncio.run(cdp_inventory([instance],{}))
+        instance,_=self.instance()
+        with self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_CDP_INVALID'):asyncio.run(cdp_inventory([instance,instance],{}))
+
+    def test_sandbox_weakening_arguments_are_refused_without_launching(self):
+        from hosted.deploy.probe.browser import cdp_inventory,DISABLED_SANDBOX_FLAGS
+        for flag in DISABLED_SANDBOX_FLAGS:
+            instance,_=self.instance(args=['/opt/playwright/chrome',flag+'=true'])
+            with self.subTest(flag=flag),self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_DISABLED'):
+                asyncio.run(cdp_inventory([instance],{}))
+
+    def test_bounded_discovery_retries_never_accept_cdp_alone(self):
+        _,_,inventory=self.fixture()
+        with self.kernel(records={})as browser, \
+             patch.object(browser,'cdp_inventory',new=AsyncMock(return_value=inventory)), \
+             patch.object(browser.asyncio,'sleep',new=AsyncMock())as sleep:
+            with self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_UNVERIFIED')as caught:asyncio.run(browser.verify_sandbox([object()]))
+        self.assertEqual(sleep.await_count,3);self.assertEqual(caught.exception.counts['scan_attempts'],4)
+        self.assertTrue(all(call.args==(.25,)for call in sleep.await_args_list))
+
+    def test_late_discovery_rechecks_all_evidence(self):
+        values,records,inventory=self.fixture()
+        with self.kernel()as browser,patch.object(browser,'process_snapshot',side_effect=[({},{}),(records,{})]), \
+             patch.object(browser,'cdp_inventory',new=AsyncMock(return_value=inventory)), \
+             patch.object(browser.asyncio,'sleep',new=AsyncMock())as sleep:
+            observed,counts=asyncio.run(browser.verify_sandbox([object()]))
+        self.assertEqual(counts['scan_attempts'],2);self.assertEqual(counts['renderer_evidence_confirmed'],2)
+        self.assertEqual(observed,{110,120,210,220});sleep.assert_awaited_once_with(.25)
+
+    def test_unsafe_or_denied_evidence_is_not_retried(self):
+        values,_,inventory=self.fixture();values[120]['CapEff']=1
+        with self.kernel(values)as browser,patch.object(browser,'cdp_inventory',new=AsyncMock(return_value=inventory)), \
+             patch.object(browser.asyncio,'sleep',new=AsyncMock())as sleep:
+            with self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_CAPABILITIES'):asyncio.run(browser.verify_sandbox([object()]))
+        sleep.assert_not_awaited()
+        with self.kernel()as browser,patch.object(browser,'cdp_inventory',new=AsyncMock(return_value=inventory)), \
+             patch.object(browser,'process_evidence',side_effect=ProbeFailure('E_SANDBOX_EVIDENCE_DENIED')), \
+             patch.object(browser.asyncio,'sleep',new=AsyncMock())as sleep:
+            with self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_EVIDENCE_DENIED'):asyncio.run(browser.verify_sandbox([object()]))
+        sleep.assert_not_awaited()
+
+    def test_pid_reuse_or_security_change_after_cdp_read_is_denied(self):
+        import copy
+        values,_,inventory=self.fixture()
+        for field in ('start','Seccomp_filters','exe','namespaces'):
+            reads={}
+            def read(pid):
+                reads[pid]=reads.get(pid,0)+1;value=copy.deepcopy(values[pid])
+                if pid==120 and reads[pid]>1:value[field]=None
+                return value
+            with self.subTest(field=field),self.kernel()as browser, \
+                 patch.object(browser,'process_evidence',side_effect=read), \
+                 patch.object(browser,'cdp_inventory',new=AsyncMock(return_value=inventory)), \
+                 self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_IDENTITY'):
+                asyncio.run(browser.verify_sandbox([object()]))
+
+    def test_changing_cdp_inventory_cannot_pass(self):
+        _,_,inventory=self.fixture()
+        with self.kernel()as browser,patch.object(browser,'cdp_inventory',new=AsyncMock(side_effect=[inventory,[]]*4)), \
+             patch.object(browser.asyncio,'sleep',new=AsyncMock())as sleep:
+            with self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_UNVERIFIED'):asyncio.run(browser.verify_sandbox([object()]))
+        self.assertEqual(sleep.await_count,3)
+
+    def test_proc_evidence_reads_pinned_directory_and_parses_tricky_stat_name(self):
+        from hosted.deploy.probe.browser import process_evidence
+        with tempfile.TemporaryDirectory()as folder:
+            root=Path(folder)/'120';(root/'ns').mkdir(parents=True)
+            for name in ('exe','ns/pid','ns/net','ns/user'):(root/name).write_text('synthetic')
+            (root/'stat').write_text('120 (name ) with spaces) '+' '.join(['S']+['0']*18+['123']))
+            status='Pid: 120\nNSpid: 120 12 1\nUid: 10001 10001 10001 10001\nNoNewPrivs: 1\nSeccomp: 2\nCapEff: 0000\nSeccomp_filters: 2\n'
+            (root/'status').write_text(status)
+            result=process_evidence(120,Path(folder));self.assertEqual(result['start'],123)
+            self.assertEqual(result['nspid'],(120,12,1));self.assertEqual(result['Seccomp_filters'],2)
+            for field in ('NSpid','Uid','Seccomp_filters','CapEff'):
+                (root/'status').write_text('\n'.join(line for line in status.splitlines()if not line.startswith(field+':')))
+                with self.subTest(field=field),self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_EVIDENCE_INVALID'):
+                    process_evidence(120,Path(folder))
+
+    def test_proc_directory_is_pinned_and_start_time_race_fails_closed(self):
+        from hosted.deploy.probe.browser import process_evidence
+        with tempfile.TemporaryDirectory()as folder:
+            root=Path(folder)/'120';(root/'ns').mkdir(parents=True)
+            for name in ('exe','ns/pid','ns/net','ns/user'):(root/name).write_text('synthetic')
+            def write_stat(start):(root/'stat').write_text('120 (name) '+' '.join(['S']+['0']*18+[str(start)]))
+            write_stat(123)
+            (root/'status').write_text('Pid: 120\nNSpid: 120 12 1\nUid: 10001 10001 10001 10001\nNoNewPrivs: 1\nSeccomp: 2\nCapEff: 0\nSeccomp_filters: 2\n')
+            real_open=os.open;stat_reads=[];directory_fds=[]
+            def opened(path,flags,**kwargs):
+                if path=='stat':
+                    stat_reads.append(kwargs['dir_fd'])
+                    if len(stat_reads)==2:write_stat(124)
+                result=real_open(path,flags,**kwargs)
+                if flags&os.O_DIRECTORY:directory_fds.append(result)
+                return result
+            with patch('os.open',side_effect=opened),self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_EVIDENCE_INVALID'):
+                process_evidence(120,Path(folder))
+            self.assertEqual(stat_reads,[directory_fds[0]]*2)
+            with self.assertRaises(OSError):os.fstat(directory_fds[0])
+
+    def test_proc_evidence_denial_and_disappearance_use_fixed_categories(self):
+        from hosted.deploy.probe.browser import process_evidence
+        for error,code in [(PermissionError('synthetic-sensitive'),'E_SANDBOX_EVIDENCE_DENIED'),
+                           (FileNotFoundError('synthetic-sensitive'),'E_SANDBOX_UNVERIFIED')]:
+            with patch('os.open',side_effect=error),self.assertRaisesRegex(ProbeFailure,code)as caught:process_evidence(120)
+            self.assertNotIn('synthetic-sensitive',str(caught.exception))
+
+    def test_executable_must_be_immutable_root_installed_playwright(self):
+        from hosted.deploy.probe.browser import trusted_executable
+        for path in ('relative/chrome','/private/tmp/chrome','/usr/bin/false'):
+            with self.subTest(path=path),self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_IDENTITY'):trusted_executable(path)
+        with patch('hosted.deploy.probe.browser.Path')as constructor:
+            path=constructor.return_value;path.is_absolute.return_value=True;path.resolve.return_value=path
+            path.is_relative_to.return_value=True;path.parents=[]
+            path.stat.return_value=SimpleNamespace(st_uid=0,st_mode=0o100755,st_dev=1,st_ino=2)
+            self.assertEqual(trusted_executable('/opt/playwright/chrome'),(1,2))
+            for uid,mode in [(10001,0o100755),(0,0o100775),(0,0o100644),(0,0o040755)]:
+                path.stat.return_value=SimpleNamespace(st_uid=uid,st_mode=mode)
+                with self.subTest(uid=uid,mode=mode),self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_IDENTITY'):
+                    trusted_executable('/opt/playwright/chrome')
 
 
 if __name__=='__main__':unittest.main()
