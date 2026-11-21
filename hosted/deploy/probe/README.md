@@ -18,7 +18,7 @@ The revised hosted-only release gate is separate:
 python -I hosted/deploy/run_release_tests.py
 ```
 
-It requires 124 tests with no failures, errors or skips. It explicitly rejects
+It requires 137 tests with no failures, errors or skips. It explicitly rejects
 hosted/runtime/test imports from another checkout, including editable-install
 fallbacks. test-gate.json names the exact modules. Fixtures are in-memory helpers
 in test_hosted_popup.py and test_hosted_analytics.py; no member exports or saved
@@ -137,6 +137,76 @@ Only discovery/exit races use the bounded retry; command-line failures never fal
 back to CDP, skip a browser or authorize a pass. Detach failures are counted while
 browser/job cleanup remains mandatory. No cookies, credentials or raw arguments
 are added to the diagnostic output.
+
+## Change A: identity-aware cleanup diagnostics (implemented)
+
+The probe retains the first PID/start-time/UID/NSpid identity of each tracked
+process before shutdown. Browser/renderer identities and roles come from the
+verified CDP/kernel evidence. Other descendants, including the third browser
+job, are captured before application shutdown. Their role labels are diagnostic
+hints from exact allowlisted executable basenames or type switches. A failed
+role read becomes unknown; it never changes sandbox authorization. Raw names,
+arguments, paths, identities, status records and exceptions are not emitted.
+Tracking never overwrites an earlier identity when a PID is reused.
+
+Post-shutdown reads pin the process directory and inspect bounded stat/status
+files. These work for zombies even when exe/namespace links no longer exist.
+A missing inner file is not enough to declare exit: the numeric process directory
+must also be absent. No signals, wait calls, process reaping or extra privileges
+are introduced by this diagnostic patch.
+
+Cleanup reports fixed integer totals and role/state cross-counts:
+
+- Roles: browser, renderer, zygote, gpu, utility, driver, crash_handler, unknown.
+- States: live, zombie, reused, unreadable, gone.
+- Totals: cleanup_tracked, cleanup_live, cleanup_zombie, cleanup_reused,
+  cleanup_unreadable, cleanup_gone, cleanup_poll_attempts and
+  cleanup_tracking_incomplete. Cross-count example: cleanup_renderer_zombie.
+- sandbox_verified=1 and the earlier sandbox counters accompany a cleanup
+  failure. This confirms the earlier stage, not overall probe success.
+
+Live includes running/sleeping/stopped kernel states. Zombie requires Z. Reused
+means the observed identity differs; labels describe the originally tracked
+role, never the replacement process. Unreadable includes denied, malformed,
+unstable, unsupported or unavailable identity evidence and a missing baseline.
+Only processes whose directories are gone pass cleanup. Live, zombie, reused,
+unreadable or incomplete tracking keeps E_BROWSER_CHILD_CLEANUP fail-closed.
+The existing 30 polls with 100 ms waits remain. Only the final snapshot counts
+are emitted, rather than cumulative counts of the same process across polls.
+
+The synthetic regressions cover state/role categories, pinned and bounded reads,
+PID reuse, missing inner files, unknown roles, incomplete tracking, the full
+shutdown failure path and counts-only output with the listener kept closed.
+The Docker/Linux behavior is still a separate Render acceptance gate.
+
+## Change B: optional PID-1 init/reaper (proposal only, NOT implemented)
+
+Recommendation: consider tini only if the next Render diagnostic shows exited,
+unreaped children. As PID 1 it can adopt orphaned descendants, reap zombies and
+forward signals to Python. It cannot reap a child still owned by a living parent,
+fix a live-child leak, repair unreadable evidence or resolve an identity mismatch.
+Its effectiveness for Run 4 remains unproven until those role/state counts exist.
+See [Tini's own documentation](https://github.com/krallin/tini#why-tini) and
+[PID-1/subreaper behavior](https://github.com/krallin/tini#subreaping).
+
+Proposed first trial, requiring separate approval: change only
+hosted/deploy/browser-probe.Dockerfile to install Debian's signed-repository tini
+package at build time and use this entrypoint, retaining its existing CMD:
+
+```dockerfile
+# PROPOSAL ONLY. No Dockerfile in this commit contains these changes.
+RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["/usr/bin/tini", "--"]
+```
+
+The existing USER 10001:10001 remains. Python becomes tini's child; Chromium
+arguments, chromium_sandbox=True, seccomp settings and capabilities stay intact.
+Use default quiet tini behavior and propagate probe failure status unchanged.
+Keep every cleanup gate fail-closed, including zombies. Approval would authorize
+a separate Dockerfile patch and test, not an automatic deploy. Compare before/
+after counts and repeat shutdown/isolation/sandbox checks on Render. Only after
+that succeeds should the equivalent production browser.Dockerfile change be
+considered for separate approval. Both Dockerfiles remain unchanged here.
 
 On PASS, only /healthz and /result are exposed, with fixed check names and boolean
 flags. MCP and /job are never mounted on the listener. On failure, output is a

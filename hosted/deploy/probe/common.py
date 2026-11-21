@@ -7,6 +7,10 @@ import socket
 from unittest.mock import patch
 
 
+CLEANUP_ROLES=('browser','renderer','zygote','gpu','utility','driver','crash_handler','unknown')
+CLEANUP_STATES=('live','zombie','reused','unreadable','gone')
+
+
 SANDBOX_COUNTS=frozenset({
     'scan_attempts','proc_entries','proc_listing_failed','proc_scan_truncated',
     'status_readable','status_denied','status_disappeared','status_invalid',
@@ -18,7 +22,9 @@ SANDBOX_COUNTS=frozenset({
     'extra_seccomp_filter_confirmed','namespace_confirmed','renderer_evidence_confirmed',
     'cdp_session_failed','cdp_process_query_failed','cdp_process_invalid',
     'cdp_process_missing','cdp_detach_failed','cmdline_invalid','cmdline_read_failed',
-})
+    'sandbox_verified','cleanup_tracked','cleanup_poll_attempts','cleanup_tracking_incomplete',
+})|frozenset('cleanup_'+state for state in CLEANUP_STATES)|frozenset(
+    'cleanup_'+role+'_'+state for role in CLEANUP_ROLES for state in CLEANUP_STATES)
 
 
 def safe_counts(values):

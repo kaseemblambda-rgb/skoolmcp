@@ -140,7 +140,7 @@ class ContainerProbeTests(unittest.TestCase):
         _,_,inventories=self.fixture();counts={}
         with self.kernel()as browser:evidence,observed=browser.kernel_verification(inventories,self.fixture()[1],counts)
         self.assertEqual(set(evidence),{100,110,120,210,220})
-        self.assertEqual(observed,{110,120,210,220})
+        self.assertEqual(set(observed),{110,120,210,220})
         self.assertEqual(counts['renderer_evidence_confirmed'],2)
         self.assertEqual(counts['cdp_renderer_descendants'],0)
         self.assertEqual(counts['extra_seccomp_filter_confirmed'],2)
@@ -249,7 +249,7 @@ class ContainerProbeTests(unittest.TestCase):
             asyncio.run(session.send('Browser.getBrowserCommandLine'))
         session.send.reset_mock()
         with self.kernel():observed,counts=asyncio.run(verify_sandbox([first,second]))
-        self.assertEqual(observed,{110,120,210,220})
+        self.assertEqual(set(observed),{110,120,210,220})
         self.assertEqual(counts['renderer_evidence_confirmed'],2)
         self.assertEqual([call.args[0]for call in session.send.await_args_list],['SystemInfo.getProcessInfo']*2)
         self.assertNotIn('synthetic-private-argument',json.dumps(counts))
@@ -349,7 +349,7 @@ class ContainerProbeTests(unittest.TestCase):
              patch.object(browser.asyncio,'sleep',new=AsyncMock())as sleep:
             observed,counts=asyncio.run(browser.verify_sandbox([object()]))
         self.assertEqual(counts['scan_attempts'],2);self.assertEqual(counts['renderer_evidence_confirmed'],2)
-        self.assertEqual(observed,{110,120,210,220});sleep.assert_awaited_once_with(.25)
+        self.assertEqual(set(observed),{110,120,210,220});sleep.assert_awaited_once_with(.25)
 
     def test_unsafe_or_denied_evidence_is_not_retried(self):
         values,_,inventory=self.fixture();values[120]['CapEff']=1
@@ -471,6 +471,191 @@ class ContainerProbeTests(unittest.TestCase):
                 path.stat.return_value=SimpleNamespace(st_uid=uid,st_mode=mode)
                 with self.subTest(uid=uid,mode=mode),self.assertRaisesRegex(ProbeFailure,'E_SANDBOX_IDENTITY'):
                     trusted_executable('/opt/playwright/chrome')
+
+    def cleanup_record(self,state='S',start=123,role='renderer'):
+        return dict(pid=120,start=start,uid=(10001,)*4,nspid=(120,12),state=state,role=role)
+
+    def cleanup_tracking(self,role='renderer'):
+        from hosted.deploy.probe.browser import cleanup_identity
+        return {120:dict(identity=cleanup_identity(self.cleanup_record()),role=role)}
+
+    def test_cleanup_reads_zombie_identity_without_exe_or_namespace_links(self):
+        from hosted.deploy.probe.browser import cleanup_process,cleanup_counts
+        with self.proc_browser(b'')as(proc,expected,_):
+            (proc/'120/exe').unlink()
+            for name in ('pid','net','user'):(proc/'120/ns'/name).unlink()
+            (proc/'120/stat').write_text('120 (name ) with spaces) '+' '.join(['Z']+['0']*18+['123']))
+            value=cleanup_process(120,proc,read_role=True)
+            self.assertEqual(value['state'],'Z');self.assertEqual(value['role'],'unknown')
+            counts=cleanup_counts(self.cleanup_tracking(),proc)
+            self.assertEqual(counts['cleanup_zombie'],1);self.assertEqual(counts['cleanup_renderer_zombie'],1)
+            self.assertEqual(counts['cleanup_unreadable'],0)
+
+    def test_cleanup_proc_reads_are_pinned_bounded_and_close_descriptors(self):
+        from hosted.deploy.probe.browser import cleanup_process
+        with self.proc_browser()as(proc,_,_):
+            real_open=os.open;opened=[]
+            def read(path,flags,**kwargs):
+                result=real_open(path,flags,**kwargs);opened.append((path,flags,kwargs.get('dir_fd'),result));return result
+            with patch('os.open',side_effect=read):value=cleanup_process(120,proc,read_role=True)
+            fd=next(item[3]for item in opened if item[1]&os.O_DIRECTORY)
+            self.assertEqual(value['start'],123)
+            self.assertTrue(all(item[2]==fd and item[1]&os.O_NOFOLLOW for item in opened if not item[1]&os.O_DIRECTORY))
+            with self.assertRaises(OSError):os.fstat(fd)
+            (proc/'120/stat').write_text('x'*65537)
+            with self.assertRaises(ValueError):cleanup_process(120,proc)
+
+    def test_cleanup_process_race_is_unreadable_and_retains_first_identity(self):
+        from hosted.deploy.probe.browser import cleanup_counts
+        with self.proc_browser()as(proc,_,_):
+            real_open=os.open;reads=[]
+            def read(path,flags,**kwargs):
+                if path=='stat':
+                    reads.append(1)
+                    if len(reads)==2:(proc/'120/stat').write_text('120 (name) '+' '.join(['S']+['0']*18+['124']))
+                return real_open(path,flags,**kwargs)
+            with patch('os.open',side_effect=read):counts=cleanup_counts(self.cleanup_tracking(),proc)
+            self.assertEqual(counts['cleanup_unreadable'],1);self.assertEqual(counts['cleanup_gone'],0)
+
+    def test_cleanup_role_hints_use_only_fixed_categories(self):
+        from hosted.deploy.probe.browser import cleanup_process
+        cases=[(b'/path/node\0','driver'),(b'/path/chrome\0','browser'),
+               (b'/path/chrome-headless-shell\0','browser'),(b'/path/headless_shell\0','browser'),
+               (b'/path/chrome_crashpad_handler\0','crash_handler'),
+               (b'x\0--type=renderer\0','renderer'),(b'x\0--type=zygote\0','zygote'),
+               (b'x\0--type=gpu-process\0','gpu'),(b'x\0--type=utility\0','utility'),
+               (b'x\0--type=synthetic-sensitive\0','unknown'),
+               (b'x\0--type=renderer\0--type=utility\0','unknown'),(b'unterminated','unknown')]
+        for raw,expected in cases:
+            with self.subTest(role=expected),self.proc_browser(raw)as(proc,_,_):
+                value=cleanup_process(120,proc,read_role=True)
+                self.assertEqual(value['role'],expected)
+                self.assertNotIn('synthetic-sensitive',json.dumps(value))
+
+    def test_cleanup_capture_keeps_first_identity_and_cdp_role(self):
+        from hosted.deploy.probe.browser import track_cleanup,cleanup_identity
+        first={**self.cleanup_record(), 'arguments':(b'synthetic-sensitive',)}
+        tracked=track_cleanup([120],verified={120:first})
+        replacement={**first,'start':999}
+        self.assertEqual(track_cleanup([120],previous=tracked,verified={120:replacement}),tracked)
+        self.assertEqual(tracked[120]['identity'],cleanup_identity(first));self.assertEqual(tracked[120]['role'],'browser')
+        with patch('hosted.deploy.probe.browser.cleanup_process',side_effect=PermissionError('synthetic-sensitive')):
+            unknown=track_cleanup([121],previous=tracked)
+        self.assertIsNone(unknown[121]['identity']);self.assertEqual(unknown[121]['role'],'unknown')
+        self.assertNotIn('synthetic-sensitive',repr(unknown))
+
+    def test_cleanup_detects_reuse_of_start_uid_or_namespace_identity(self):
+        from hosted.deploy.probe.browser import cleanup_counts
+        for field,value in [('start',999),('uid',(10002,)*4),('nspid',(120,13))]:
+            row={**self.cleanup_record(),field:value}
+            with self.subTest(field=field),patch('hosted.deploy.probe.browser.cleanup_process',return_value=row):
+                counts=cleanup_counts(self.cleanup_tracking())
+            self.assertEqual(counts['cleanup_reused'],1);self.assertEqual(counts['cleanup_renderer_reused'],1)
+            self.assertEqual(counts['cleanup_gone'],0)
+
+    def test_cleanup_missing_inner_file_is_not_proof_of_exit(self):
+        from hosted.deploy.probe.browser import cleanup_counts
+        for absent in (False,True):
+            with self.subTest(directory_absent=absent), \
+                 patch('hosted.deploy.probe.browser.cleanup_process',side_effect=FileNotFoundError()), \
+                 patch('hosted.deploy.probe.browser.proc_absent',return_value=absent):
+                counts=cleanup_counts(self.cleanup_tracking())
+            self.assertEqual(counts['cleanup_gone'],int(absent))
+            self.assertEqual(counts['cleanup_unreadable'],int(not absent))
+        with self.proc_browser()as(proc,_,_):
+            (proc/'120/status').unlink()
+            counts=cleanup_counts(self.cleanup_tracking(),proc)
+            self.assertEqual(counts['cleanup_unreadable'],1)
+
+    def test_cleanup_unreadable_baseline_and_invalid_state_do_not_pass(self):
+        from hosted.deploy.probe.browser import cleanup_counts
+        cases=[({120:dict(identity=None,role='unknown')},self.cleanup_record()),
+               (self.cleanup_tracking(),self.cleanup_record(state='X'))]
+        for tracked,row in cases:
+            with patch('hosted.deploy.probe.browser.cleanup_process',return_value=row):counts=cleanup_counts(tracked)
+            self.assertEqual(counts['cleanup_unreadable'],1);self.assertEqual(counts['cleanup_gone'],0)
+        with patch('hosted.deploy.probe.browser.cleanup_process',side_effect=PermissionError('synthetic-sensitive')):
+            counts=cleanup_counts(self.cleanup_tracking(role='synthetic-sensitive'))
+        self.assertEqual(counts['cleanup_unknown_unreadable'],1)
+        self.assertNotIn('synthetic-sensitive',json.dumps(counts))
+
+    def test_cleanup_all_unresolved_states_fail_closed_with_same_budget(self):
+        from hosted.deploy.probe.browser import check_child_cleanup
+        cases=[('live',self.cleanup_record()),('zombie',self.cleanup_record(state='Z')),
+               ('reused',self.cleanup_record(start=999)),('unreadable',PermissionError('synthetic-sensitive'))]
+        for state,value in cases:
+            reader=MagicMock(side_effect=value)if isinstance(value,Exception)else MagicMock(return_value=value)
+            with self.subTest(state=state),patch('hosted.deploy.probe.browser.cleanup_process',reader), \
+                 patch('hosted.deploy.probe.browser.asyncio.sleep',new=AsyncMock())as sleep, \
+                 patch('os.kill',side_effect=AssertionError('Diagnostics must not send signals')):
+                with self.assertRaisesRegex(ProbeFailure,'E_BROWSER_CHILD_CLEANUP')as caught:
+                    asyncio.run(check_child_cleanup(self.cleanup_tracking(),{'sandbox_verified':1,'namespace_confirmed':2}))
+            counts=caught.exception.counts
+            self.assertEqual(counts['cleanup_'+state],1);self.assertEqual(counts['cleanup_poll_attempts'],30)
+            self.assertEqual(counts['sandbox_verified'],1);self.assertEqual(counts['namespace_confirmed'],2)
+            self.assertEqual(sleep.await_count,30)
+            self.assertTrue(all(call.args==(.1,)for call in sleep.await_args_list))
+            self.assertNotIn('synthetic-sensitive',json.dumps(counts))
+
+    def test_cleanup_passes_only_when_all_tracked_entries_are_gone(self):
+        from hosted.deploy.probe.browser import check_child_cleanup
+        with patch('hosted.deploy.probe.browser.cleanup_process',side_effect=FileNotFoundError()), \
+             patch('hosted.deploy.probe.browser.proc_absent',return_value=True), \
+             patch('hosted.deploy.probe.browser.asyncio.sleep',new=AsyncMock())as sleep:
+            counts=asyncio.run(check_child_cleanup(self.cleanup_tracking(),{'sandbox_verified':1}))
+        self.assertEqual(counts['cleanup_tracked'],1);self.assertEqual(counts['cleanup_gone'],1)
+        self.assertEqual(counts['cleanup_renderer_gone'],1);self.assertEqual(counts['cleanup_poll_attempts'],1)
+        sleep.assert_not_awaited()
+
+    def test_incomplete_tracking_remains_fail_closed_even_if_known_entries_exit(self):
+        from hosted.deploy.probe.browser import check_child_cleanup
+        with patch('hosted.deploy.probe.browser.cleanup_process',side_effect=FileNotFoundError()), \
+             patch('hosted.deploy.probe.browser.proc_absent',return_value=True), \
+             patch('hosted.deploy.probe.browser.asyncio.sleep',new=AsyncMock()):
+            with self.assertRaisesRegex(ProbeFailure,'E_BROWSER_CHILD_CLEANUP')as caught:
+                asyncio.run(check_child_cleanup(self.cleanup_tracking(),{'sandbox_verified':1,'cleanup_tracking_incomplete':1}))
+        self.assertEqual(caught.exception.counts['cleanup_tracking_incomplete'],1)
+        self.assertEqual(caught.exception.counts['cleanup_gone'],1)
+
+    def test_cleanup_failure_reports_counts_without_raw_process_data_or_listener(self):
+        from hosted.deploy.probe.browser import check_child_cleanup
+        with patch('hosted.deploy.probe.browser.cleanup_process',return_value=self.cleanup_record(state='Z')), \
+             patch('hosted.deploy.probe.browser.asyncio.sleep',new=AsyncMock()):
+            try:asyncio.run(check_child_cleanup(self.cleanup_tracking(),{'sandbox_verified':1}))
+            except ProbeFailure as exc:error=exc
+            else:self.fail('Zombie must fail cleanup')
+        error.counts.update(pid=120,start=123,arguments='synthetic-sensitive',role='synthetic-sensitive')
+        with patch('hosted.deploy.probe.main.run',side_effect=error),patch('hosted.deploy.probe.main.serve')as serve:
+            out=io.StringIO()
+            with contextlib.redirect_stdout(out):status=main(['--mode','browser','--serve'])
+        report=json.loads(out.getvalue());self.assertEqual(status,1);serve.assert_not_called()
+        self.assertEqual(report['sandbox_counts']['cleanup_renderer_zombie'],1)
+        self.assertEqual(report['sandbox_counts']['sandbox_verified'],1)
+        self.assertNotIn('synthetic-sensitive',out.getvalue())
+        self.assertTrue(all(type(value)is int for value in report['sandbox_counts'].values()))
+        self.assertFalse({'pid','start','arguments','role'}&set(report['sandbox_counts']))
+
+    def test_full_probe_attaches_cleanup_and_passed_sandbox_counts(self):
+        from hosted.deploy.probe import browser
+        class SyntheticBrowser(browser.FakeBrowser):
+            def __init__(self):
+                super().__init__();self.directory=tempfile.TemporaryDirectory(prefix='cleanup-test-')
+                self.browser=SimpleNamespace(is_connected=lambda:not self.closed)
+                self.context=SimpleNamespace(add_cookies=AsyncMock(),cookies=AsyncMock(return_value=[]))
+            async def close(self):
+                await super().close();self.directory.cleanup()
+        original_sleep=asyncio.sleep
+        async def wait(delay):await original_sleep(delay if delay==180 else 0)
+        with patch.object(browser,'LoginBrowser',SyntheticBrowser), \
+             patch.object(browser,'verify_sandbox',new=AsyncMock(return_value=(self.cleanup_tracking(),{'renderer_evidence_confirmed':2}))), \
+             patch.object(browser,'process_snapshot',return_value=({},{})), \
+             patch.object(browser,'cleanup_process',return_value=self.cleanup_record(state='Z')), \
+             patch.object(browser.asyncio,'sleep',side_effect=wait):
+            with self.assertRaisesRegex(ProbeFailure,'E_BROWSER_CHILD_CLEANUP')as caught:
+                asyncio.run(browser.check_browser(True))
+        self.assertEqual(caught.exception.counts['sandbox_verified'],1)
+        self.assertEqual(caught.exception.counts['renderer_evidence_confirmed'],2)
+        self.assertEqual(caught.exception.counts['cleanup_renderer_zombie'],1)
 
 
 if __name__=='__main__':unittest.main()

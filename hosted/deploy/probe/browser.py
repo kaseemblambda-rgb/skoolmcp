@@ -7,7 +7,7 @@ import secrets
 import stat
 
 from catknows.hosted_browser_service import build_browser_app,LoginBrowser
-from .common import require,request,offline,ProbeFailure,safe_counts
+from .common import require,request,offline,ProbeFailure,safe_counts,CLEANUP_ROLES,CLEANUP_STATES
 
 
 class FakeBrowser:
@@ -256,6 +256,112 @@ def kernel_verification(inventories,records,counts):
     return evidence,set(children)|used
 
 
+def cleanup_process(pid,proc=Path('/proc'),*,read_role=False):
+    """Read identity/state from a pinned proc directory, including zombie records.
+
+    Unlike sandbox evidence, this does not require exe/ns links to survive exit.
+    Role hints are internal, diagnostic only and cannot authorize sandbox/cleanup.
+    """
+    fd=os.open(proc/str(pid),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        def read(name,binary=False):
+            child=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd)
+            with os.fdopen(child,'rb'if binary else'r')as stream:value=stream.read(65537)
+            if len(value)>65536:raise ValueError()
+            return value
+        def parse(value):
+            prefix,tail=value.rsplit(')',1);fields=tail.split()
+            if int(prefix.split('(',1)[0])!=pid:raise ValueError()
+            start=int(fields[19])
+            if start<0:raise ValueError()
+            return start,fields[0]
+        first,_=parse(read('stat'))
+        fields=dict(line.split(':',1)for line in read('status').splitlines()if ':'in line)
+        uid=tuple(map(int,fields['Uid'].split()));nspid=tuple(map(int,fields['NSpid'].split()))
+        if int(fields['Pid'])!=pid or len(uid)!=4 or min(uid)<0 or not nspid or nspid[0]!=pid or min(nspid)<=0:
+            raise ValueError()
+        role='unknown'
+        if read_role:
+            try:
+                raw=read('cmdline',True)
+                if not raw.endswith(b'\0'):raise ValueError()
+                args=raw[:-1].split(b'\0')
+                if not args or not args[0]or len(args)>4096:raise ValueError()
+                types=[arg.split(b'=',1)[1]for arg in args if arg.startswith(b'--type=')]
+                if len(types)==1:
+                    role={b'renderer':'renderer',b'zygote':'zygote',b'gpu-process':'gpu',b'utility':'utility'}.get(types[0],'unknown')
+                elif not types:
+                    role={b'node':'driver',b'chrome_crashpad_handler':'crash_handler',
+                          b'chrome':'browser',b'chrome-headless-shell':'browser',b'headless_shell':'browser'}.get(args[0].rsplit(b'/',1)[-1],'unknown')
+            except (OSError,ValueError):pass
+        final,state=parse(read('stat'))
+        if first!=final:raise ValueError()
+        return dict(pid=pid,start=first,uid=uid,nspid=nspid,state=state,role=role)
+    finally:os.close(fd)
+
+
+def cleanup_identity(value):
+    return value['pid'],value['start'],tuple(value['uid']),tuple(value['nspid'])
+
+
+def proc_absent(pid,proc=Path('/proc')):
+    # A missing inner file alone is not proof that the process directory is gone.
+    try:os.stat(proc/str(pid),follow_symlinks=False)
+    except (FileNotFoundError,ProcessLookupError):return True
+    except OSError:pass
+    return False
+
+
+def track_cleanup(pids,previous=None,verified=None,proc=Path('/proc')):
+    """Retain the first observed identity/role; never replace it after PID reuse."""
+    tracked=dict(previous or {})
+    for pid in pids:
+        if pid in tracked:continue
+        value=(verified or {}).get(pid)
+        if value is not None:
+            role='browser'if 'arguments'in value else'renderer'
+        else:
+            try:value=cleanup_process(pid,proc,read_role=True);role=value['role']
+            except (FileNotFoundError,ProcessLookupError):
+                if proc_absent(pid,proc):continue
+                value=None;role='unknown'
+            except (OSError,ValueError,KeyError,IndexError,UnicodeError):value=None;role='unknown'
+        tracked[pid]=dict(identity=cleanup_identity(value)if value is not None else None,
+                          role=role if role in CLEANUP_ROLES else'unknown')
+    return tracked
+
+
+def cleanup_counts(tracked,proc=Path('/proc')):
+    counts={'cleanup_tracked':len(tracked)}
+    counts.update({'cleanup_'+state:0 for state in CLEANUP_STATES})
+    for pid,expected in tracked.items():
+        role=expected['role']if expected['role']in CLEANUP_ROLES else'unknown'
+        try:
+            value=cleanup_process(pid,proc)
+            if expected['identity']is None:state='unreadable'
+            elif cleanup_identity(value)!=expected['identity']:state='reused'
+            elif value['state']=='Z':state='zombie'
+            elif value['state']in ('R','S','D','T','t','I','W','K','P'):state='live'
+            else:state='unreadable'
+        except (FileNotFoundError,ProcessLookupError):state='gone'if proc_absent(pid,proc)else'unreadable'
+        except (OSError,ValueError,KeyError,IndexError,UnicodeError):state='unreadable'
+        counts['cleanup_'+state]+=1
+        key='cleanup_'+role+'_'+state;counts[key]=counts.get(key,0)+1
+    return safe_counts(counts)
+
+
+async def check_child_cleanup(tracked,counts):
+    # Same bounded 30 polls / three-second budget. Presence never authorizes PASS.
+    for attempt in range(1,31):
+        final=cleanup_counts(tracked)
+        final.update(cleanup_poll_attempts=attempt,
+                     cleanup_tracking_incomplete=int(bool(counts.get('cleanup_tracking_incomplete'))))
+        if final['cleanup_gone']==final['cleanup_tracked']and not final['cleanup_tracking_incomplete']:
+            return safe_counts({**counts,**final})
+        await asyncio.sleep(.1)
+    raise ProbeFailure('E_BROWSER_CHILD_CLEANUP',{**counts,**final})
+
+
 async def verify_sandbox(instances):
     # Bounded retry only for discovery/exit races. Unsafe/unreadable evidence fails.
     for attempt in range(1,5):
@@ -272,7 +378,7 @@ async def verify_sandbox(instances):
                 identity={k:v for k,v in expected.items()if k!='arguments'}
                 actual=process_evidence(pid,browser_expected=identity,counts=counts)if 'arguments'in expected else process_evidence(pid)
                 if actual!=expected:raise ProbeFailure('E_SANDBOX_IDENTITY')
-            return observed,safe_counts(counts)
+            return track_cleanup(observed,verified=evidence),safe_counts(counts)
         except ProbeFailure as exc:
             if str(exc)=='E_SANDBOX_UNVERIFIED'and attempt<4:
                 await asyncio.sleep(.25);continue
@@ -280,7 +386,7 @@ async def verify_sandbox(instances):
 
 
 async def check_browser(live=False,diagnostics=None):
-    instances=[];observed=set();secret=secrets.token_urlsafe(32)
+    instances=[];observed={};counts={};secret=secrets.token_urlsafe(32)
     def factory():
         browser=LoginBrowser()if live else FakeBrowser();instances.append(browser);return browser
     app=build_browser_app(factory=factory,secret=secret)
@@ -303,6 +409,7 @@ async def check_browser(live=False,diagnostics=None):
             require(not any(c['name']in('probe_isolation','auth_token')for c in await b.context.cookies()),'E_BROWSER_COOKIE_LEAK')
             require(not any(c['name']=='auth_token'for c in await a.context.cookies()),'E_BROWSER_UNEXPECTED_LOGIN')
             observed,counts=await verify_sandbox(instances)
+            counts['sandbox_verified']=1
             if diagnostics is not None:diagnostics.update(safe_counts(counts))
         frames=[await job('command',i,{'type':'frame'})for i in (1,2)]
         require(all(status==200 and 'frame'in body and 'session'not in body for status,body in frames),'E_BROWSER_FRAME')
@@ -312,14 +419,14 @@ async def check_browser(live=False,diagnostics=None):
         require((await job('close',2))[0]==200,'E_BROWSER_CLOSE')
         # Keep one job open so application shutdown must clean it too.
         require((await job('start',3))[0]==200,'E_BROWSER_SLOT_RELEASE')
-        if live:observed|=set(descendants())
+        if live:
+            records,scan=process_snapshot()
+            counts['cleanup_tracking_incomplete']=int(bool(scan.get('proc_listing_failed')or scan.get('proc_scan_truncated')))
+            observed=track_cleanup(descendants(records),previous=observed)
     if live:
         require(all(not b.browser.is_connected()and not Path(b.directory.name).exists()for b in instances),'E_BROWSER_CLEANUP')
-        for _ in range(30):
-            lingering=[p for p in observed if Path(f'/proc/{p}/status').exists()]
-            if not lingering:break
-            await asyncio.sleep(.1)
-        require(not lingering,'E_BROWSER_CHILD_CLEANUP')
+        counts=await check_child_cleanup(observed,counts)
+        if diagnostics is not None:diagnostics.update(safe_counts(counts))
     else:require(all(b.closed for b in instances),'E_BROWSER_FAKE_CLEANUP')
     return [('chromium_'if live else 'fake_browser_')+name for name in
         ('auth_denial','two_jobs','isolation','capacity','frame','error_cleanup','shutdown_cleanup')]+(['chromium_sandbox_verified']if live else [])

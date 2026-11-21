@@ -61,5 +61,5 @@
     "test_hosted_analytics.py: Batch, FakeClient, Registry",
     "test_hosted_popup.py: SyntheticStore, http"
   ],
-  "expected_tests": 124
+  "expected_tests": 137
 }
