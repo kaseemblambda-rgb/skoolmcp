@@ -1,3 +1,12 @@
+# Current offline production configuration review
+
+See [PRODUCTION_REVIEW.md](PRODUCTION_REVIEW.md) and
+[production-review.json](production-review.json) for the current two-service map,
+Tini parity, uploader boundaries and remaining live gates. Those files supersede
+the historical draft status below. Migration 007, hosted_server provisioning and
+sfc-v1 registration have since been confirmed by the user; this review does not
+repeat them. No Render production resources, keys or deploys were created.
+
 # Render preparation: draft, not deployed
 
 The [synthetic container harness](probe/README.md) is ready for local offline

@@ -75,7 +75,7 @@ class ContainerProbeTests(unittest.TestCase):
         docker=(ROOT/'hosted/deploy/browser-probe.Dockerfile').read_text()
         return docker.split("RUN python - <<'TINI_INSTALL'\n",1)[1].split('\nTINI_INSTALL',1)[0]
 
-    def test_pinned_init_is_only_in_browser_probe_and_preserves_runtime_command(self):
+    def test_pinned_init_in_browser_probe_preserves_probe_command(self):
         import ast
         docker=(ROOT/'hosted/deploy/browser-probe.Dockerfile').read_text()
         assignments={node.targets[0].id:ast.literal_eval(node.value)for node in ast.parse(self.tini_installer()).body
@@ -86,7 +86,7 @@ class ContainerProbeTests(unittest.TestCase):
         command=next(line for line in docker.splitlines()if line.startswith('CMD '))
         self.assertEqual(json.loads(command[4:]),['python','-m','hosted_probe.main','--mode','browser','--container',
                                                 '--serve','--private-service','--live-browser'])
-        for name in ('browser','gateway','gateway-probe'):
+        for name in ('gateway','gateway-probe'):
             self.assertNotIn('tini',(ROOT/f'hosted/deploy/{name}.Dockerfile').read_text())
         self.assertNotIn('--no-sandbox',docker)
 

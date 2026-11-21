@@ -1,0 +1,71 @@
+{
+  "review_only": true,
+  "deploy_ready": false,
+  "workspace": {"name": "Stealth Founders Club", "plan": "Hobby", "id": null},
+  "repository": "https://github.com/kaseemblambda-rgb/skoolmcp",
+  "branch": "hosted-mcp",
+  "approved_production_commit": null,
+  "region": "virginia",
+  "monthly_compute_usd": 50,
+  "services": {
+    "gateway": {
+      "name": "stealth-mcp", "type": "web_service", "runtime": "docker",
+      "plan": "1c-2g", "instances": 1, "auto_deploy": "off", "disk": false,
+      "autoscaling": false, "environment_groups": [], "root_directory": "",
+      "dockerfile": "hosted/deploy/gateway.Dockerfile", "docker_context": ".",
+      "docker_command_override": "", "effective_command": "python -m catknows.hosted_server",
+      "health_check": "/healthz", "port": "10000", "public": true
+    },
+    "browser": {
+      "name": "stealth-mcp-browser", "type": "private_service", "runtime": "docker",
+      "plan": "1c-2g", "instances": 1, "auto_deploy": "off", "disk": false,
+      "autoscaling": false, "environment_groups": [], "root_directory": "",
+      "dockerfile": "hosted/deploy/browser.Dockerfile", "docker_context": ".",
+      "docker_command_override": "", "effective_command": "python -m catknows.hosted_browser_service",
+      "entrypoint": "/usr/local/bin/tini --", "health_check": "TCP",
+      "port": "8001", "public": false
+    }
+  },
+  "environment": {
+    "gateway": {
+      "PUBLIC_BASE_URL": {"secret": false, "value": null, "source": "Initial gateway HTTPS onrender.com origin after creation; custom domain only in a later approved cutover"},
+      "SFC_PAID_TIERS": {"secret": false, "value": "premium,standard"},
+      "HOSTED_OAUTH_REDIRECT_URIS": {"secret": false, "value": null, "source": "JSON array of exact connector callbacks; no wildcard. Confirm ChatGPT callback from its connector management page"},
+      "HOSTED_RENDER_PROXY_CIDRS": {"secret": false, "value": null, "source": "JSON array of independently verified Render ingress proxy CIDRs; never outbound IP ranges or 0.0.0.0/0"},
+      "HOSTED_FORWARDED_PROXY_CIDRS": {"secret": false, "value": "[]", "source": "Optional; add only independently verified intermediate proxy networks"},
+      "SKOOL_SESSION_KEY_VERSION": {"secret": false, "value": "sfc-v1"},
+      "HOSTED_DB_HOST": {"secret": false, "value": "aws-0-us-east-1.pooler.supabase.com"},
+      "HOSTED_DB_PORT": {"secret": false, "value": "5432"},
+      "HOSTED_DB_NAME": {"secret": false, "value": "postgres"},
+      "HOSTED_DB_USER": {"secret": false, "value": null, "source": "hosted_server.<same Supabase project reference>"},
+      "HOSTED_DB_SSLROOTCERT": {"secret": false, "value": "/etc/secrets/supabase-project-ca.crt", "source": "Genuine project CA as runtime secret file; certificate is public, never a CA private key"},
+      "BROWSER_SERVICE_URL": {"secret": false, "value": null, "source": "https://<actual browser private DNS>:8001"},
+      "BROWSER_TLS_CA_PEM": {"secret": false, "value": null, "source": "Public CA certificate from reviewed private TLS issuance; signing key stays off Render"},
+      "PORT": {"secret": false, "value": "10000"},
+      "WEB_CONCURRENCY": {"secret": false, "value": "1"},
+      "HOSTED_DB_PASSWORD": {"secret": true, "source": "Keychain Stealth Hosted Server / hosted_server.<project>"},
+      "SKOOL_SESSION_ENCRYPTION_KEY": {"secret": true, "source": "Existing bound Keychain runtime entry"},
+      "BROWSER_SERVICE_SECRET": {"secret": true, "source": "Existing bound Keychain runtime entry; same value on both services"},
+      "HOSTED_IP_HASH_SECRET": {"secret": true, "source": "Existing bound Keychain runtime entry"}
+    },
+    "browser": {
+      "PORT": {"secret": false, "value": "8001"},
+      "WEB_CONCURRENCY": {"secret": false, "value": "1"},
+      "BROWSER_TLS_CERT_PEM": {"secret": false, "value": null, "source": "Leaf server certificate for exact browser private DNS, signed by private CA"},
+      "BROWSER_TLS_KEY_PEM": {"secret": true, "source": "Future Keychain Stealth Hosted Browser TLS / <project>:browser-tls; leaf key only"},
+      "BROWSER_SERVICE_SECRET": {"secret": true, "source": "Existing bound Keychain runtime entry; same value on both services"}
+    }
+  },
+  "platform_supplied": ["RENDER"],
+  "excluded_for_beta": ["SKOOL_SESSION_PREVIOUS_KEYS", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_ACCESS_TOKEN", "RENDER_API_KEY", "CATKNOWS_COOKIE", "HOSTED_OWNER_PROFILE_DIR", "SFC_PAID_TIERS on browser"],
+  "unresolved_before_production": [
+    "Frozen and separately approved GitHub production commit containing Tini change",
+    "Actual workspace/service IDs, private browser DNS and public gateway origin",
+    "Verified ingress proxy CIDRs and X-Forwarded-For chain behavior",
+    "Exact Claude/ChatGPT callback URLs accepted by the current public-client DCR implementation",
+    "Separately reviewed private CA/leaf issuance and protected Keychain leaf-bundle creation",
+    "Genuine Supabase CA runtime file upload; no secret file is copied into an image",
+    "Manual confirmation no linked environment groups or inherited secret files",
+    "Production container builds and live readiness/isolation checks"
+  ]
+}
