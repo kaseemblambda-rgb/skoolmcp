@@ -18,7 +18,7 @@ The revised hosted-only release gate is separate:
 python -I hosted/deploy/run_release_tests.py
 ```
 
-It requires 137 tests with no failures, errors or skips. It explicitly rejects
+It requires 140 tests with no failures, errors or skips. It explicitly rejects
 hosted/runtime/test imports from another checkout, including editable-install
 fallbacks. test-gate.json names the exact modules. Fixtures are in-memory helpers
 in test_hosted_popup.py and test_hosted_analytics.py; no member exports or saved
@@ -179,34 +179,45 @@ PID reuse, missing inner files, unknown roles, incomplete tracking, the full
 shutdown failure path and counts-only output with the listener kept closed.
 The Docker/Linux behavior is still a separate Render acceptance gate.
 
-## Change B: optional PID-1 init/reaper (proposal only, NOT implemented)
+## Change B: pinned PID-1 init/reaper (browser probe only)
 
-Recommendation: consider tini only if the next Render diagnostic shows exited,
-unreaped children. As PID 1 it can adopt orphaned descendants, reap zombies and
-forward signals to Python. It cannot reap a child still owned by a living parent,
-fix a live-child leak, repair unreadable evidence or resolve an identity mismatch.
-Its effectiveness for Run 4 remains unproven until those role/state counts exist.
-See [Tini's own documentation](https://github.com/krallin/tini#why-tini) and
-[PID-1/subreaper behavior](https://github.com/krallin/tini#subreaping).
+Run 5 reported sandbox_verified=1, live=0, zombie=6, unreadable=0 and reused=0.
+The approved next trial adds tini only to hosted/deploy/browser-probe.Dockerfile.
+The production browser.Dockerfile and both gateway images remain unchanged.
 
-Proposed first trial, requiring separate approval: change only
-hosted/deploy/browser-probe.Dockerfile to install Debian's signed-repository tini
-package at build time and use this entrypoint, retaining its existing CMD:
+The image downloads the upstream Linux/amd64 Tini v0.19.0 binary over verified
+HTTPS and enforces this hardcoded SHA-256 before writing or chmod-ing the file:
 
-```dockerfile
-# PROPOSAL ONLY. No Dockerfile in this commit contains these changes.
-RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
-ENTRYPOINT ["/usr/bin/tini", "--"]
+```text
+93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c
 ```
 
-The existing USER 10001:10001 remains. Python becomes tini's child; Chromium
-arguments, chromium_sandbox=True, seccomp settings and capabilities stay intact.
-Use default quiet tini behavior and propagate probe failure status unchanged.
-Keep every cleanup gate fail-closed, including zombies. Approval would authorize
-a separate Dockerfile patch and test, not an automatic deploy. Compare before/
-after counts and repeat shutdown/isolation/sandbox checks on Render. Only after
-that succeeds should the equivalent production browser.Dockerfile change be
-considered for separate approval. Both Dockerfiles remain unchanged here.
+The downloaded 24,064-byte binary was independently compared with the upstream
+release's tini-amd64.sha256sum during preparation. Neither binary nor checksum
+asset is added to the repository. The image build checks the pinned digest, not
+a mutable checksum fetched alongside the binary. Oversized/mismatched downloads
+fail the build with E_TINI_CHECKSUM. Version/hash have no build-argument override.
+
+Source: [Tini v0.19.0 release](https://github.com/krallin/tini/releases/tag/v0.19.0).
+The entrypoint is /usr/local/bin/tini followed by --; the existing Python CMD and
+USER 10001:10001 remain. The installed binary is root-owned and mode 0555. Default
+quiet tini behavior forwards signals and preserves the probe's exit status.
+Python becomes tini's child. Chromium arguments, chromium_sandbox=True, seccomp,
+capabilities and every sandbox/cleanup gate remain unchanged. Tini runs as PID 1
+under the image entrypoint; no extra privileges or process-killing code are added.
+
+Tini can adopt/reap orphaned zombies. It cannot reap a child still owned by a
+living parent, fix a live-child leak or repair unreadable/changed identity data.
+See [Tini's PID-1 behavior](https://github.com/krallin/tini#subreaping). Zombie
+entries still fail E_BROWSER_CHILD_CLEANUP if they remain. The probe code and
+cleanup budget are unchanged. The next separately approved Render run must prove
+cleanup_gone=cleanup_tracked with all unresolved categories zero and the sandbox
+checks still passing. This local patch does not claim a successful Linux run.
+
+Offline tests enforce the immutable artifact/version/hash, unchanged CMD/user,
+image scope, rejection before install for corrupt/oversized payloads, and verified
+payload installation with mode 0555. The full cleanup/sandbox regressions still
+run. Applying the equivalent change to production needs separate approval.
 
 On PASS, only /healthz and /result are exposed, with fixed check names and boolean
 flags. MCP and /job are never mounted on the listener. On failure, output is a

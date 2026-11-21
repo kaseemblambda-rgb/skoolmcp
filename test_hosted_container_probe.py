@@ -71,6 +71,50 @@ class ContainerProbeTests(unittest.TestCase):
         for service in ('gateway','browser'):
             self.assertFalse(any('/probe/'in path for path in manifest[service]))
 
+    def tini_installer(self):
+        docker=(ROOT/'hosted/deploy/browser-probe.Dockerfile').read_text()
+        return docker.split("RUN python - <<'TINI_INSTALL'\n",1)[1].split('\nTINI_INSTALL',1)[0]
+
+    def test_pinned_init_is_only_in_browser_probe_and_preserves_runtime_command(self):
+        import ast
+        docker=(ROOT/'hosted/deploy/browser-probe.Dockerfile').read_text()
+        assignments={node.targets[0].id:ast.literal_eval(node.value)for node in ast.parse(self.tini_installer()).body
+                     if isinstance(node,ast.Assign)and isinstance(node.value,ast.Constant)}
+        self.assertEqual(assignments['url'],'https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64')
+        self.assertEqual(assignments['expected'],'93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c')
+        self.assertIn('USER 10001:10001\nENTRYPOINT ["/usr/local/bin/tini", "--"]',docker)
+        command=next(line for line in docker.splitlines()if line.startswith('CMD '))
+        self.assertEqual(json.loads(command[4:]),['python','-m','hosted_probe.main','--mode','browser','--container',
+                                                '--serve','--private-service','--live-browser'])
+        for name in ('browser','gateway','gateway-probe'):
+            self.assertNotIn('tini',(ROOT/f'hosted/deploy/{name}.Dockerfile').read_text())
+        self.assertNotIn('--no-sandbox',docker)
+
+    def test_tini_corrupt_or_oversized_download_cannot_be_installed(self):
+        from urllib.request import urlopen
+        for data in (b'synthetic-corrupt-binary',b'x'*1048577):
+            with self.subTest(size=len(data)),patch('urllib.request.urlopen',return_value=io.BytesIO(data))as download, \
+                 patch('pathlib.Path')as destination:
+                with self.assertRaisesRegex(SystemExit,'E_TINI_CHECKSUM'):
+                    exec(compile(self.tini_installer(),'<tini-install>','exec'),{})
+                destination.assert_not_called()
+                download.assert_called_once_with('https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64',timeout=30)
+
+    def test_tini_installs_only_checksum_verified_payload_with_readonly_executable_mode(self):
+        import ast,hashlib
+        # Offline positive-path fixture: change only the expected digest in memory.
+        # The independent structural test above verifies the real immutable pin.
+        data=b'synthetic-valid-binary';tree=ast.parse(self.tini_installer())
+        for node in tree.body:
+            if isinstance(node,ast.Assign)and getattr(node.targets[0],'id',None)=='expected':
+                node.value=ast.Constant(hashlib.sha256(data).hexdigest())
+        ast.fix_missing_locations(tree)
+        with patch('urllib.request.urlopen',return_value=io.BytesIO(data)),patch('pathlib.Path')as destination:
+            exec(compile(tree,'<tini-install-fixture>','exec'),{})
+        destination.assert_called_once_with('/usr/local/bin/tini')
+        destination.return_value.write_bytes.assert_called_once_with(data)
+        destination.return_value.chmod.assert_called_once_with(0o555)
+
     def test_production_entry_points_do_not_import_probe(self):
         for name in ('catknows/hosted_server.py','catknows/hosted_browser_service.py'):
             self.assertNotIn('hosted_probe',(ROOT/name).read_text())
