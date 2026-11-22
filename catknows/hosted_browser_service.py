@@ -32,6 +32,8 @@ def allowed_request(url, method, resource, top_level=True):
         # The exact hostname allowlist also rejects every IP literal/metadata host.
         if resource == "document":
             return top_level and parsed.hostname == "www.skool.com" and parsed.path == "/login" and method == "GET"
+        if parsed.hostname == "www.skool.com" and method == "GET" and parsed.path.startswith("/_next/static/"):
+            return resource != "websocket"
         if parsed.hostname == "api2.skool.com":
             return method == "POST" and parsed.path == "/auth/login" and resource in ("fetch","xhr")
         if parsed.hostname == "ct.skool.com":
@@ -40,10 +42,12 @@ def allowed_request(url, method, resource, top_level=True):
             return (method in ("GET","POST") and resource in ("fetch","xhr","ping")) or (
                 method == "GET" and resource in ("script","image"))
         if parsed.hostname == WAF_HOST:
+            if parsed.path == "/auth" or parsed.path.startswith("/auth/"):
+                return False
             if method == "GET" and resource == "script":
                 return parsed.path.endswith("/challenge.js")
             if resource in ("fetch","xhr"):
-                return (method == "GET" and parsed.path == "/inputs") or (method == "POST" and parsed.path == "/verify")
+                return (method == "GET" and parsed.path == "/inputs") or method == "POST"
             return method == "GET" and resource == "image"
         if parsed.hostname == "assets.skool.com":
             return method == "GET" and resource in ("script","stylesheet","font","image")

@@ -25,6 +25,57 @@ from test_hosted_analytics import FakeClient,Registry
 
 
 class BrowserPolicyTests(unittest.TestCase):
+    def test_exact_waf_host_accepts_dynamic_challenge_posts(self):
+        for path in ('/opaque-one/opaque-two/opaque-three','/other-endpoint','/verify','/'):
+            for kind in ('fetch','xhr'):
+                self.assertTrue(allowed_request('https://'+WAF_HOST+path,'POST',kind))
+        self.assertTrue(allowed_request('https://'+WAF_HOST+'/opaque/challenge.js','GET','script'))
+        self.assertTrue(allowed_request('https://'+WAF_HOST+'/inputs','GET','fetch'))
+
+    def test_waf_post_exception_preserves_auth_origin_and_resource_denials(self):
+        for path in ('/auth','/auth/login','/auth/google','/auth/apple','/auth/login-with-code'):
+            for kind in ('fetch','xhr','document'):
+                self.assertFalse(allowed_request('https://'+WAF_HOST+path,'POST',kind))
+        for host in ('other.edge.sdk.awswaf.com',WAF_HOST+'.evil.test'):
+            self.assertFalse(allowed_request('https://'+host+'/a/b/c','POST','fetch'))
+        for method,kind in (('GET','fetch'),('PUT','fetch'),('DELETE','xhr'),('POST','script'),('POST','other'),('POST','document')):
+            self.assertFalse(allowed_request('https://'+WAF_HOST+'/a/b/c',method,kind))
+        for url in ('http://'+WAF_HOST+'/a/b/c','https://'+WAF_HOST+':444/a/b/c','https://user@'+WAF_HOST+'/a/b/c'):
+            self.assertFalse(allowed_request(url,'POST','fetch'))
+
+    def test_www_next_static_get_accepts_other_and_static_resource_types(self):
+        url='https://www.skool.com/_next/static/chunks/synthetic-asset.js'
+        for kind in ('other','script','stylesheet','image','font','media','texttrack','manifest','fetch','xhr'):
+            self.assertTrue(allowed_request(url,'GET',kind),kind)
+        for kind in ('document','websocket'):
+            self.assertFalse(allowed_request(url,'GET',kind))
+        for method in ('POST','PUT','DELETE','OPTIONS'):
+            self.assertFalse(allowed_request(url,method,'other'))
+
+    def test_static_exception_does_not_expand_auth_paths_hosts_or_prefix(self):
+        for path in ('/_next/static','/_next/static-lookalike/chunk.js','/_next/data/build/community.json',
+                     '/auth','/auth/google','/auth/login','/auth/login-with-code','/stealth','/'):
+            self.assertFalse(allowed_request('https://www.skool.com'+path,'GET','other'))
+        for host in ('fonts.googleapis.com','fonts.gstatic.com','js.stripe.com','sentry.io',
+                     'example.ingest.sentry.io','www.skool.com.evil.test','random.example.test'):
+            self.assertFalse(allowed_request('https://'+host+'/_next/static/chunk.js','GET','other'))
+            self.assertFalse(allowed_request('https://'+host+'/a/b/c','POST','fetch'))
+        self.assertTrue(allowed_request('https://api2.skool.com/auth/login','POST','fetch'))
+        for path in ('/auth/google','/auth/apple','/auth/login-with-code','/auth/login-with-code-init'):
+            self.assertFalse(allowed_request('https://api2.skool.com'+path,'POST','fetch'))
+
+    def test_route_continues_observed_waf_post_and_next_static_other(self):
+        browser=LoginBrowser();page=SimpleNamespace();frame=SimpleNamespace(page=page);page.main_frame=frame;browser.page=page
+        async def check():
+            for url,method,kind in (('https://'+WAF_HOST+'/opaque-one/opaque-two/opaque-three','POST','fetch'),
+                ('https://'+WAF_HOST+'/opaque-one/opaque-two/opaque-three','POST','xhr'),
+                ('https://www.skool.com/_next/static/chunks/synthetic-asset.js','GET','other')):
+                route=SimpleNamespace(request=SimpleNamespace(url=url,method=method,resource_type=kind,frame=frame),
+                    continue_=AsyncMock(),abort=AsyncMock())
+                await browser.route_request(route)
+                route.continue_.assert_awaited_once();route.abort.assert_not_awaited()
+        asyncio.run(check())
+
     def test_exact_skool_tracking_host_allows_background_requests_only(self):
         self.assertIn('www.skool.com',BROWSER_HOSTS)
         self.assertIn('ct.skool.com',BROWSER_HOSTS)
@@ -59,7 +110,7 @@ class BrowserPolicyTests(unittest.TestCase):
         # Reproduce why the old hostname-only message cannot diagnose a loop.
         self.assertFalse(allowed_request('https://www.skool.com/','GET','document'))
         self.assertFalse(allowed_request('https://www.skool.com/_next/data/build/group.json','GET','fetch'))
-        self.assertFalse(allowed_request('https://'+WAF_HOST+'/other-endpoint','POST','xhr'))
+        self.assertTrue(allowed_request('https://'+WAF_HOST+'/other-endpoint','POST','xhr'))
         self.assertTrue(allowed_request('https://www.skool.com/login','GET','document'))
         self.assertTrue(allowed_request('https://'+WAF_HOST+'/inputs','GET','xhr'))
 
