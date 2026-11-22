@@ -14,9 +14,10 @@
     "test_hosted_release_scope",
     "test_hosted_ca_oauth",
     "test_hosted_login_completion",
-    "test_hosted_sfc_owner"
+    "test_hosted_sfc_owner",
+    "test_hosted_analytics_concurrency"
   ],
   "scope": "Hosted runtime and synthetic container checks only. Mac exporter, scheduler, reconciliation and updater suites are excluded.",
-  "expected_tests": 242,
+  "expected_tests": 266,
   "allow_skips": false
 }

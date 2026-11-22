@@ -175,7 +175,7 @@ class HostedSecurityTests(unittest.TestCase):
             calls=0
             async def verify_token(self,value):
                 self.calls+=1
-                return token if self.calls==1 else None
+                return token if self.calls<=2 else None
         verifier=Verifier()
         def provider(subject):
             c=FakeClient(subject);created.append(c);return c
@@ -183,7 +183,7 @@ class HostedSecurityTests(unittest.TestCase):
         async def check():
             with patch('catknows.hosted_tools.get_access_token',return_value=token):
                 with self.assertRaises(ValueError):await registry.tools['get_revenue_analytics']('account-a')
-            verifier.calls=1
+            verifier.calls=2
             with patch('catknows.hosted_tools.get_access_token',return_value=SimpleNamespace(subject='account-b',token='synthetic')):
                 with self.assertRaises(PermissionError):await registry.tools['list_my_communities']()
         asyncio.run(check());self.assertEqual(len(created),1);self.assertTrue(created[0].closed)

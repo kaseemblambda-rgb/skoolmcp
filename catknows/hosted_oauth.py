@@ -20,6 +20,11 @@ from .hosted_analytics import moment
 from .hosted_security import ReadOnlyTransport, RateBudget
 
 
+OWNER_PROOF_TTL = 60.0
+OWNER_SLOT_WAIT = 3.0
+OWNER_CACHE_LIMIT = 128
+
+
 authorization_browser = ContextVar("stealth_authorization_browser", default=None)
 authorization_source = ContextVar("stealth_authorization_source", default=None)
 
@@ -214,6 +219,8 @@ class SkoolOAuthProvider(OAuthAuthorizationServerProvider):
         self.settings = settings
         self.owner_reader = owner_reader
         self.owner_slots = asyncio.Semaphore(2)
+        self.owner_proofs = {}
+        self.owner_checks = {}
         self.store = store or OAuthStore(settings)
         self.redirect_uris = frozenset(redirect_uris if redirect_uris is not None else
             json.loads(os.environ.get("HOSTED_OAUTH_REDIRECT_URIS", "[]")))
@@ -314,10 +321,52 @@ class SkoolOAuthProvider(OAuthAuthorizationServerProvider):
         return OAuthToken(access_token=access, refresh_token=refresh,
             expires_in=max(0, min(300, refresh_token.expires_at-int(time.time()))), scope="mcp:read")
 
+    @staticmethod
+    def owner_binding(row):
+        return tuple(row.get(key) for key in ("account_id","skool_user_id","sfc_group_id",
+            "generation","kind","client_id","resource","expires_at"))
+
     async def owner_access(self, row, token):
-        """Recheck owner-only grants on every bearer use, using the bound saved session."""
+        """Coalesce the same token's live checks; cache successful proofs for at most 60s."""
+        key=hashed(token);binding=self.owner_binding(row);now=time.monotonic()
+        for cached,(deadline,_) in list(self.owner_proofs.items()):
+            if deadline<=now:
+                self.owner_proofs.pop(cached,None)
+        proof=self.owner_proofs.get(key)
+        if proof is not None and proof[1]==binding:
+            return True
+        self.owner_proofs.pop(key,None)
+        pending=self.owner_checks.get(key)
+        if pending is not None and pending[1].done():
+            self.owner_checks.pop(key,None)
+            pending=None
+        if pending is not None:
+            if pending[0]!=binding:
+                return False
+            return await asyncio.shield(pending[1])
+        if len(self.owner_checks)>=OWNER_CACHE_LIMIT:
+            return False
+        async def live():
+            allowed=await self.owner_access_live(row,token)
+            if allowed:
+                if len(self.owner_proofs)>=OWNER_CACHE_LIMIT:
+                    self.owner_proofs.pop(min(self.owner_proofs,key=lambda k:self.owner_proofs[k][0]),None)
+                self.owner_proofs[key]=(time.monotonic()+OWNER_PROOF_TTL,binding)
+            return allowed
+        task=asyncio.create_task(live())
+        self.owner_checks[key]=(binding,task)
+        def finished(done):
+            if self.owner_checks.get(key)==(binding,done):
+                self.owner_checks.pop(key,None)
+            if not done.cancelled():done.exception()
+        task.add_done_callback(finished)
+        # One disconnected request cannot cancel a check used by the other waiters.
+        return await asyncio.shield(task)
+
+    async def owner_access_live(self, row, token):
+        """Only a live check can create or refresh a successful proof."""
         try:
-            await asyncio.wait_for(self.owner_slots.acquire(),timeout=.1)
+            await asyncio.wait_for(self.owner_slots.acquire(),timeout=OWNER_SLOT_WAIT)
         except TimeoutError:
             return False
         task=None
@@ -355,12 +404,22 @@ class SkoolOAuthProvider(OAuthAuthorizationServerProvider):
         try:
             row = await self.call("token_get", token_hash=hashed(token))
             if not row or row["kind"] != "access" or row["resource"] != self.settings.resource:
+                self.owner_proofs.pop(hashed(token),None)
                 return None
             expires = moment(row["expires_at"])
             if expires is None or expires.timestamp()<=time.time():
                 return None
-            if row.get("access_basis")=="sfc_owner" and not await self.owner_access(row,token):
-                return None
+            if row.get("access_basis")=="sfc_owner":
+                if not await self.owner_access(row,token):
+                    self.owner_proofs.pop(hashed(token),None)
+                    return None
+                # Also re-read after a shared check: revocation/generation changes
+                # during the upstream work must defeat every waiting request.
+                current=await self.call("token_get",token_hash=hashed(token))
+                if (not current or current.get("access_basis")!="sfc_owner"
+                    or self.owner_binding(current)!=self.owner_binding(row)):
+                    self.owner_proofs.pop(hashed(token),None)
+                    return None
             return AccessToken(token=token, client_id=row["client_id"], subject=row["account_id"],
                 scopes=["mcp:read"], resource=row["resource"],
                 expires_at=int(moment(row["expires_at"]).timestamp()), claims={"iss": self.settings.public_origin})

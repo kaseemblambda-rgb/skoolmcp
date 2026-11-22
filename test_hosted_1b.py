@@ -487,7 +487,8 @@ class NativeProviderToolTests(unittest.TestCase):
                 tasks=[asyncio.create_task(call(0))]
                 try:
                     self.assertTrue(await asyncio.to_thread(first_started.wait,2))
-                    with self.assertRaisesRegex(ValueError,'already running'):await call(0)
+                    with patch('catknows.hosted_tools.TOOL_QUEUE_WAIT',.01):
+                        with self.assertRaisesRegex(ValueError,'already running'):await call(0)
                     self.assertEqual(len(created),1)
                     tasks.extend(asyncio.create_task(call(i))for i in range(1,4))
                     self.assertTrue(await asyncio.to_thread(started.wait,2))

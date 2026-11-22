@@ -17,6 +17,8 @@ def install_private_logging():
             import re
             host = record.msg if isinstance(record.msg,str) and re.fullmatch(r"[A-Za-z0-9.-]{1,253}",record.msg) else "invalid-host"
             record.msg = "blocked_host="+host
+        elif record.name == "stealth.hosted.tool_failure":
+            record.msg = safe_tool_failure(record.msg)
         elif record.name == "stealth.hosted.login_lifecycle":
             record.msg = safe_login_lifecycle(record.msg)
         elif record.name == "stealth.hosted.login_diagnostics":
@@ -45,6 +47,22 @@ def audit(event):
     logger = logging.getLogger("stealth.hosted.audit")
     logger.setLevel(logging.INFO)
     logger.info(event)
+
+
+def safe_tool_failure(value):
+    tools={"get_revenue_analytics","get_revenue_by_tier"}
+    reasons={"access_denied","rate_limited","account_busy","queue_timeout","capacity_busy",
+        "session_unavailable","authorization_unavailable","community_denied","upstream_failed",
+        "response_invalid","result_too_large","session_changed","coverage_incomplete","invalid_chart","cleanup_failed"}
+    if (isinstance(value,dict) and isinstance(value.get("tool"),str) and isinstance(value.get("reason"),str)
+        and value["tool"] in tools and value["reason"] in reasons):
+        return "tool_failure tool="+value["tool"]+" reason="+value["reason"]
+    return "tool_failure_invalid"
+
+
+def tool_failure(tool,reason):
+    if tool is not None:
+        logging.getLogger("stealth.hosted.tool_failure").warning({"tool":tool,"reason":reason})
 
 
 def blocked_host(host):

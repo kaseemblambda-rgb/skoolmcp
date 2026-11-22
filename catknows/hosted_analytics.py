@@ -48,12 +48,16 @@ def billing(member):
         return {}
 
 
+class MemberCoverageError(ValueError):
+    pass
+
+
 def members(client, slug):
     batch = client.members(slug, sort="newest")
     complete = (not getattr(batch, "incomplete", False) and not getattr(batch, "capped_by_role", False)
                 and getattr(batch, "total_members", None) == len(batch))
     if not complete:
-        raise ValueError("Complete member pagination required; retry after reconnecting")
+        raise MemberCoverageError("Complete member pagination required; retry after reconnecting")
     return batch, {"members_retrieved": len(batch), "members_complete": True}
 
 
@@ -99,6 +103,20 @@ CHART_FIELDS = {
     "mrr_cashflow": ("date","month","year","net","one_time","refunds","fees","disputes","affiliates"),
     "mrr_unit": ("date","arpu","ltv"),
 }
+
+
+# User-facing labels resolve to existing verified Skool chart parameters only.
+CHART_ALIASES = {"churn":"mrr", "retention":"retention_members",
+    "sources":"signups_by_source", "cash_flow":"mrr_cashflow"}
+
+
+def resolve_chart(chart):
+    if not isinstance(chart,str):
+        raise ValueError("Unsupported chart")
+    source=CHART_ALIASES.get(chart,chart)
+    if source not in CHART_FIELDS:
+        raise ValueError("Unsupported chart")
+    return source
 
 
 def dashboard(client, group_id, chart):

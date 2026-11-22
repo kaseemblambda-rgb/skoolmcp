@@ -2,13 +2,14 @@
 import asyncio
 import json
 import re
+from typing import Literal
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.types import ToolAnnotations
 
 from . import hosted_analytics as a, normalize
 from . import hosted_activity as activity
-from .hosted_security import audit, RateBudget
+from .hosted_security import audit, RateBudget, tool_failure
 
 
 def identifier(value):
@@ -25,68 +26,122 @@ def detail(client, slug, group_id, post_slug):
     return post
 
 
+TOOL_QUEUE_WAIT = 15.0
+TOOL_QUEUE_LIMIT = 16
+TOOL_SUBJECT_LIMIT = 128
+
+
 def register_tools(server, provider, verifier):
     slots = asyncio.Semaphore(4)
-    active_subjects = set()
+    subjects = {}
     budget = RateBudget(60)
 
-    async def run(operation, slug=None, admin=True):
+    async def run(operation, slug=None, admin=True, tool_name=None):
         token = get_access_token()
         verified = await verifier.verify_token(token.token) if token is not None and token.subject else None
         if verified is None or verified.subject != token.subject:
-            audit("tool_denied")
+            audit("tool_denied");tool_failure(tool_name,"access_denied")
             raise PermissionError("Authenticated paid membership required")
 
         if not budget.allow(token.subject):
-            audit("tool_busy")
+            audit("tool_busy");tool_failure(tool_name,"rate_limited")
             raise ValueError("Read limit reached; retry in one minute")
 
         def execute():
-            client = provider(token.subject)
+            client=None
+            stage="session_unavailable"
             try:
+                client = provider(token.subject)
+                stage="authorization_unavailable"
                 group = a.authorized(client, slug, admin) if slug is not None else None
+                stage="upstream_failed"
                 result = operation(client, group)
+                stage="response_invalid"
                 # Never allow upstream credential-bearing raw objects into output.
                 if len(json.dumps(result, default=str).encode()) > 512000:
+                    stage="result_too_large"
                     raise ValueError("Result too large; narrow the request")
+                stage="session_changed"
                 if hasattr(provider, "assert_current"):
                     provider.assert_current(token.subject, client)
                 return result
+            except a.MemberCoverageError:
+                tool_failure(tool_name,"coverage_incomplete")
+                raise
+            except PermissionError:
+                tool_failure(tool_name,"community_denied" if stage=="authorization_unavailable" else stage)
+                raise
+            except Exception:
+                tool_failure(tool_name,stage)
+                raise
             finally:
-                client.http._http.close()
+                if client is not None:
+                    try:client.http._http.close()
+                    except Exception:
+                        tool_failure(tool_name,"cleanup_failed")
+                        raise
+
+        state=subjects.get(token.subject)
+        if state is None:
+            if len(subjects)>=TOOL_SUBJECT_LIMIT:
+                audit("tool_busy");tool_failure(tool_name,"capacity_busy")
+                raise ValueError("Service busy; retry shortly")
+            state=[asyncio.Lock(),0]
+            subjects[token.subject]=state
+        if state[1]>=TOOL_QUEUE_LIMIT:
+            audit("tool_busy");tool_failure(tool_name,"account_busy")
+            raise ValueError("Too many pending requests for this account; retry shortly")
+        state[1]+=1
+        acquired=False;global_slot=False
         try:
-            await asyncio.wait_for(slots.acquire(), timeout=0.1)
-        except TimeoutError:
-            audit("tool_busy")
-            raise ValueError("Service busy; retry shortly") from None
-        if token.subject in active_subjects:
-            slots.release()
-            raise ValueError("A request is already running for this account")
-        active_subjects.add(token.subject)
-        task = asyncio.create_task(asyncio.to_thread(execute))
-        try:
-            result = await asyncio.shield(task)
+            try:
+                async with asyncio.timeout(TOOL_QUEUE_WAIT):
+                    await state[0].acquire()
+                    acquired=True
+            except TimeoutError:
+                audit("tool_busy");tool_failure(tool_name,"queue_timeout")
+                raise ValueError("A request is already running for this account; retry shortly") from None
+            # Queued requests do not reserve global slots. Keep one active read per account.
+            try:
+                async with asyncio.timeout(0.1):
+                    await slots.acquire()
+                    global_slot=True
+            except TimeoutError:
+                audit("tool_busy");tool_failure(tool_name,"capacity_busy")
+                raise ValueError("Service busy; retry shortly") from None
+            # Membership/token may have changed while this request was queued.
             verified = await verifier.verify_token(token.token)
             if verified is None or verified.subject != token.subject:
-                raise PermissionError("Access ended during read")
-            audit("tool_succeeded")
-            return result
-        except asyncio.CancelledError:
-            # Keep the slot until the upstream work actually stops.
+                audit("tool_denied");tool_failure(tool_name,"access_denied")
+                raise PermissionError("Access ended while waiting")
+            task = asyncio.create_task(asyncio.to_thread(execute))
             try:
-                await task
+                result = await asyncio.shield(task)
+                verified = await verifier.verify_token(token.token)
+                if verified is None or verified.subject != token.subject:
+                    tool_failure(tool_name,"access_denied")
+                    raise PermissionError("Access ended during read")
+                audit("tool_succeeded")
+                return result
+            except asyncio.CancelledError:
+                # Keep both slots until the upstream work actually stops.
+                while not task.done():
+                    try:await asyncio.shield(task)
+                    except asyncio.CancelledError:continue
+                    except Exception:break
+                if task.done() and not task.cancelled():task.exception()
+                raise
+            except activity.CoverageError:
+                audit("tool_failed")
+                raise ValueError("Complete activity coverage unavailable; narrow the period or reconnect Skool") from None
             except Exception:
-                pass
-            raise
-        except activity.CoverageError:
-            audit("tool_failed")
-            raise ValueError("Complete activity coverage unavailable; narrow the period or reconnect Skool") from None
-        except Exception:
-            audit("tool_failed")
-            raise ValueError("Skool request unavailable; check connection, permissions or data coverage") from None
+                audit("tool_failed")
+                raise ValueError("Skool request unavailable; check connection, permissions or data coverage") from None
         finally:
-            active_subjects.discard(token.subject)
-            slots.release()
+            if global_slot:slots.release()
+            if acquired:state[0].release()
+            state[1]-=1
+            if state[1]==0:subjects.pop(token.subject,None)
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True))
     async def list_my_communities() -> dict:
@@ -106,16 +161,26 @@ def register_tools(server, provider, verifier):
         return await run(read,community_slug)
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True))
-    async def get_revenue_analytics(community_slug: str, chart: str = "mrr") -> dict:
-        """Owner/admin chart values including MRR, realized churn, retention, sources and cash flow."""
-        if chart not in a.CHART_FIELDS:
-            raise ValueError("Unsupported chart")
-        return await run(lambda c,g:a.dashboard(c,g["id"],chart),community_slug)
+    async def get_revenue_analytics(community_slug: str, chart: Literal[
+        "mrr","churn","retention","sources","cash_flow","signups_by_source","signups_by_day",
+        "members","retention_members","retention_cohorts","mrr_cashflow","mrr_unit"] = "mrr") -> dict:
+        """Owner/admin charts. churn uses MRR churn components; retention is member retention;
+        sources is signup attribution; cash_flow is community-wide cash flow.
+        Canonical Skool chart names are also accepted. community_slug is required."""
+        try:source=a.resolve_chart(chart)
+        except ValueError:
+            tool_failure("get_revenue_analytics","invalid_chart")
+            raise
+        def read(c,g):
+            result=a.dashboard(c,g["id"],source)
+            result["chart"]={"requested":chart,"source":source}
+            return result
+        return await run(read,community_slug,tool_name="get_revenue_analytics")
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True))
     async def get_revenue_by_tier(community_slug: str) -> dict:
         """Owner/admin estimated current recurring run rate by tier and currency."""
-        return await run(lambda c,g:a.tier_revenue(c,community_slug),community_slug)
+        return await run(lambda c,g:a.tier_revenue(c,community_slug),community_slug,tool_name="get_revenue_by_tier")
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True))
     async def get_member_value_by_country(community_slug: str) -> dict:

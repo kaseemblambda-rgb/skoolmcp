@@ -58,7 +58,8 @@
     "hosted/deploy/certs/supabase-prod-ca-2021.crt.sha256",
     "test_hosted_ca_oauth.py",
     "test_hosted_login_completion.py",
-    "test_hosted_sfc_owner.py"
+    "test_hosted_sfc_owner.py",
+    "test_hosted_analytics_concurrency.py"
   ],
   "requires": "Revised hosted-only manifest for user review. No commit or push until the revised scope and test gate are approved.",
   "test_gate": "hosted/deploy/test-gate.json",

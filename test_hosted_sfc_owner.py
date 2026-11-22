@@ -73,6 +73,7 @@ class OwnerFlowTests(unittest.TestCase):
                 self.assertEqual(status,200);token=json.loads(body)['access_token']
                 self.assertIsNotNone(await c.provider.load_access_token(token));self.assertGreaterEqual(len(seen),2)
                 c.provider.owner_reader=lambda session,identity:None
+                c.provider.owner_proofs.clear()  # Exercise ownership loss after the bounded cache expires.
                 self.assertIsNone(await c.provider.load_access_token(token))
                 self.assertEqual(c.store.sessions,{});self.assertEqual(c.store.owners,{})
                 self.assertIsNone(await c.provider.load_access_token(token))
@@ -144,6 +145,7 @@ class OwnerFlowTests(unittest.TestCase):
                 task.cancel();await asyncio.sleep(.01);self.assertTrue(c.provider.owner_slots.locked())
                 release.set()
                 with self.assertRaises(asyncio.CancelledError):await task
+                await asyncio.gather(*(entry[1] for entry in list(c.provider.owner_checks.values())),return_exceptions=True)
                 self.assertFalse(c.provider.owner_slots.locked())
         asyncio.run(check())
 
