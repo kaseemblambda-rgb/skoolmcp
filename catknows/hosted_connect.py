@@ -129,13 +129,12 @@ PAGE="""<!doctype html><meta charset="utf-8"><meta name="viewport" content="widt
 <title>Connect Skool</title><style>body{font:16px Arial;max-width:1050px;margin:32px auto;padding:16px}button{padding:12px;border-radius:8px}img{max-width:100%;border:1px solid #ddd}img:focus-visible{outline:2px solid #f0175e;outline-offset:3px}#message{min-height:24px}</style>
 <h1>Connect Skool</h1><p>Sign in on Skool's streamed login page. Disconnect deletes your saved Skool session.</p>
 <button id="connect">Connect Skool</button> <button id="disconnect">Disconnect Skool</button>
-<p id="message"></p><p id="diagnostics" role="status" aria-live="polite"></p><img id="screen" alt="Skool login page" tabindex="0" hidden>
+<p id="message"></p><img id="screen" alt="Skool login page" tabindex="0" hidden>
 <script src="/connect/skool.js" defer></script>"""
 SCRIPT="""
 const message=document.querySelector('#message');
 const screen=document.querySelector('#screen');
 const connect=document.querySelector('#connect');
-const diagnostics=document.querySelector('#diagnostics');
 let ws=null, busy=false, timer=null;
 const pending=[];
 async function post(path){
@@ -162,7 +161,6 @@ function transmit(command){
 }
 function clearStream(){
  clearInterval(timer);
- diagnostics.textContent='';
  pending.length=0;
  busy=false;
  screen.hidden=true;
@@ -183,19 +181,6 @@ function openLogin(ticket){
    clearStream();
    message.textContent='Skool connected. You can close this tab.';
    return;
-  }
-  if(v.diagnostics){
-   const d=v.diagnostics;
-   const parts=[];
-   if(d.login_status)parts.push('Skool login HTTP '+d.login_status);
-   if(d.waf_status)parts.push('Security check HTTP '+d.waf_status);
-   if(d.blocked_requests)parts.push('Blocked requests: '+d.blocked_requests);
-   if(d.failed_requests)parts.push('Failed requests: '+d.failed_requests);
-   if(d.challenge_frame_present)parts.push('Skool security challenge present');
-   if(d.auth_cookie_present&&!d.waf_cookie_present)parts.push('Waiting for the security cookie');
-   if(d.login_status===200&&!d.auth_cookie_present)parts.push('Waiting for the signed-in cookie');
-   if(d.login_status>=400)parts.push('Skool rejected this login request. Review the login page or security challenge.');
-   diagnostics.textContent=parts.join(' · ');
   }
   if(v.frame){
    screen.hidden=false;
@@ -400,16 +385,7 @@ def routes(settings,store=None,verifier=None,bridge_factory=BrowserBridge):
                         raise ValueError("Connection invalidated")
                     await socket.send_json({"connected":True})
                     return
-                diagnostics=data.get("diagnostics")or{}
-                safe={}
-                for name in ("blocked_requests","failed_requests","login_status","waf_status","challenge_status"):
-                    value=diagnostics.get(name)
-                    if type(value) is int and 0<=value<=10000:
-                        safe[name]=value
-                for name in ("auth_cookie_present","waf_cookie_present","challenge_frame_present"):
-                    if type(diagnostics.get(name)) is bool:
-                        safe[name]=diagnostics[name]
-                await socket.send_json({"frame":data["frame"],"diagnostics":safe})
+                await socket.send_json({"frame":data["frame"]})
                 incoming=await asyncio.wait_for(socket.receive_text(),timeout=min(15,max(0.1,deadline-time.monotonic())))
                 if len(incoming)>2048:
                     raise ValueError("Invalid input")

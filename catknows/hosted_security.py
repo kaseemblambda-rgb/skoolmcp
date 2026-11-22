@@ -17,6 +17,12 @@ def install_private_logging():
             import re
             host = record.msg if isinstance(record.msg,str) and re.fullmatch(r"[A-Za-z0-9.-]{1,253}",record.msg) else "invalid-host"
             record.msg = "blocked_host="+host
+        elif record.name == "stealth.hosted.login_diagnostics":
+            import json
+            record.msg = "login_diagnostics="+json.dumps(safe_login_diagnostics(record.msg),sort_keys=True,separators=(",",":"))
+        elif record.name == "stealth.hosted.blocked_request":
+            import json
+            record.msg = "blocked_request="+json.dumps(safe_blocked_request(record.msg),sort_keys=True,separators=(",",":"))
         else:
             record.msg = event if event in EVENTS else "hosted_diagnostic"
         record.args = ()
@@ -42,6 +48,55 @@ def audit(event):
 def blocked_host(host):
     """The only dynamic log value is a parsed hostname, never a URL or payload."""
     logging.getLogger("stealth.hosted.blocked_host").warning(host)
+
+
+def safe_login_diagnostics(values):
+    """Fixed bounded counts/statuses only; never request URLs, cookies or payloads."""
+    safe={}
+    if isinstance(values,dict):
+        for name in ("blocked_requests","failed_requests","login_status","waf_status","challenge_status"):
+            value=values.get(name)
+            if type(value) is int and (0<=value<=10000 if name.endswith("_requests") else 100<=value<=599):
+                safe[name]=value
+    return safe
+
+
+def login_diagnostics(values):
+    logger=logging.getLogger("stealth.hosted.login_diagnostics")
+    logger.setLevel(logging.INFO)
+    logger.info(safe_login_diagnostics(values))
+
+
+def safe_blocked_request(values):
+    """Temporary policy diagnostics: fixed categories and redacted path only."""
+    import re
+    if not isinstance(values,dict):
+        values={}
+    method=values.get("method")
+    resource=values.get("resource_type")
+    host=values.get("host")
+    path=values.get("path")
+    # Opaque IDs, build hashes and tokens can occur in paths, not just queries.
+    known=frozenset(("login","auth","_next","static","data","assets","favicon.ico",
+        "challenge.js","challenge","inputs","verify","verifycaptcha","captcha","collect",
+        "events","event","telemetry","v1","v2","api","pixel","index.html"))
+    parts=path.split("/") if isinstance(path,str) and len(path)<=4096 else []
+    redacted="/"+"/".join(part if part in known else "<redacted>" for part in parts if part)[:512]
+    return dict(method=method if method in ("GET","POST","PUT","PATCH","DELETE","OPTIONS","HEAD") else "unknown",
+        resource_type=resource if resource in ("document","stylesheet","image","media","font","script",
+            "texttrack","xhr","fetch","eventsource","websocket","manifest","ping","other") else "unknown",
+        host=host if isinstance(host,str) and re.fullmatch(r"[A-Za-z0-9.-]{1,253}",host) else "invalid-host",
+        path=redacted)
+
+
+def blocked_request(url,method,resource_type):
+    """Never inspect request headers/body or log a raw URL/query/fragment."""
+    try:
+        parsed=urlsplit(url)
+        values=dict(method=method,resource_type=resource_type,host=parsed.hostname or "invalid-host",path=parsed.path)
+    except (ValueError,UnicodeError,TypeError):
+        values={}
+    logging.getLogger("stealth.hosted.blocked_request").warning(safe_blocked_request(values))
 
 
 class ReadOnlyTransport:

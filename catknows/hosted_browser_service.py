@@ -19,7 +19,7 @@ LOGIN="https://www.skool.com/login"
 
 
 WAF_HOST = "017ae153ccc5.edge.sdk.awswaf.com"
-BROWSER_HOSTS = frozenset({"www.skool.com", "api2.skool.com", "assets.skool.com", WAF_HOST})
+BROWSER_HOSTS = frozenset({"www.skool.com", "ct.skool.com", "api2.skool.com", "assets.skool.com", WAF_HOST})
 
 
 def allowed_request(url, method, resource, top_level=True):
@@ -34,6 +34,11 @@ def allowed_request(url, method, resource, top_level=True):
             return top_level and parsed.hostname == "www.skool.com" and parsed.path == "/login" and method == "GET"
         if parsed.hostname == "api2.skool.com":
             return method == "POST" and parsed.path == "/auth/login" and resource in ("fetch","xhr")
+        if parsed.hostname == "ct.skool.com":
+            if parsed.path.startswith("/auth/"):
+                return False
+            return (method in ("GET","POST") and resource in ("fetch","xhr","ping")) or (
+                method == "GET" and resource in ("script","image"))
         if parsed.hostname == WAF_HOST:
             if method == "GET" and resource == "script":
                 return parsed.path.endswith("/challenge.js")
@@ -89,6 +94,15 @@ class LoginDiagnostics:
         self.login_status=None
         self.waf_status=None
         self.challenge_status=None
+        self._logged=None
+
+    def log(self):
+        from .hosted_security import login_diagnostics
+        values=dict(blocked_requests=self.blocked_requests,failed_requests=self.failed_requests,
+            login_status=self.login_status,waf_status=self.waf_status,challenge_status=self.challenge_status)
+        if values != self._logged:
+            login_diagnostics(values)
+            self._logged=values.copy()
 
     def blocked(self):
         self.blocked_requests=min(10000,self.blocked_requests+1)
@@ -107,6 +121,7 @@ class LoginDiagnostics:
             self.challenge_status=status
 
     def snapshot(self,session,challenge_frame=False):
+        self.log()
         return dict(blocked_requests=self.blocked_requests,failed_requests=self.failed_requests,
             login_status=self.login_status,waf_status=self.waf_status,challenge_status=self.challenge_status,
             auth_cookie_present=session.is_valid,waf_cookie_present=bool(session.waf_token),
@@ -148,14 +163,15 @@ class LoginBrowser:
 
     async def check_navigation(self, frame):
         if frame is self.page.main_frame and not allowed_request(frame.url,"GET","document",True):
-            from .hosted_security import blocked_host
+            from .hosted_security import blocked_host, blocked_request
             try: host=urlsplit(frame.url).hostname or "invalid-host"
             except ValueError: host="invalid-host"
             blocked_host(host)
+            blocked_request(frame.url,"GET","document")
             await self.page.close()
 
     async def route_request(self, route):
-        from .hosted_security import blocked_host
+        from .hosted_security import blocked_host, blocked_request
         request=route.request
         try:
             frame=request.frame
@@ -170,6 +186,7 @@ class LoginBrowser:
             try: host=urlsplit(request.url).hostname or "invalid-host"
             except ValueError: host="invalid-host"
             blocked_host(host)
+            blocked_request(request.url,request.method,request.resource_type)
             await route.abort("blockedbyclient")
 
     async def command(self, command):
@@ -209,6 +226,7 @@ class LoginBrowser:
         from .auth import _cookies_to_session
         # Only cookies for Skool's own URL enter the saved session.
         session=_cookies_to_session(await self.context.cookies(["https://www.skool.com/"]))
+        self.network.log()
         if session.is_valid and session.waf_token:
             return {"session":{"cookie_header":session.cookie_header,
                     "auth_token":session.auth_token,"waf_token":session.waf_token}}

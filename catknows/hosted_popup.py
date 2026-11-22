@@ -26,7 +26,6 @@ img:focus-visible,button:focus-visible{outline:2px solid #f0175e;outline-offset:
 #consent{background:white;border:1px solid #ddd;border-radius:16px;padding:24px}#message{min-height:24px}
 [hidden]{display:none!important}</style>
 <h1>Connect Stealth MCP</h1><p>Your typing passes through this temporary browser service to Skool. Passwords are not saved.</p><p id="message" role="status">Preparing your Skool sign-in.</p>
-<p id="diagnostics" role="status" aria-live="polite"></p>
 <img id="screen" alt="Skool email and password sign-in" tabindex="0" hidden>
 <button id="connect" hidden>Connect Skool</button><button id="disconnect" hidden>Disconnect Skool</button>
 <section id="consent" hidden><h2>Allow this connector to read your Skool communities?</h2>
@@ -51,7 +50,7 @@ SCRIPT = SCRIPT[:start] + """async function post(path,body={}){
 """ + SCRIPT[end:]
 SCRIPT = SCRIPT.replace("/account/skool/stream", "/connect/stream").replace("JSON.stringify({ticket})", "JSON.stringify({flow})")
 start = SCRIPT.index("  if(v.connected){")
-end = SCRIPT.index("  if(v.diagnostics){")
+end = SCRIPT.index("  if(v.frame){")
 SCRIPT = SCRIPT[:start] + """  if(v.error){complete=true;clearStream();message.textContent=v.error;return;}
   if(v.ready){
    complete=true;
@@ -247,16 +246,7 @@ def routes(settings, provider, identity_reader=skool_identity, bridge_factory=Br
                     await socket.send_json({"ready":True})
                     ready = True
                     return
-                safe = {}
-                for name in ("blocked_requests","failed_requests","login_status","waf_status","challenge_status"):
-                    value = (data.get("diagnostics") or {}).get(name)
-                    if type(value) is int and 0<=value<=10000:
-                        safe[name]=value
-                for name in ("auth_cookie_present","waf_cookie_present","challenge_frame_present"):
-                    value=(data.get("diagnostics") or {}).get(name)
-                    if type(value) is bool:
-                        safe[name]=value
-                await socket.send_json({"frame":data["frame"],"diagnostics":safe})
+                await socket.send_json({"frame":data["frame"]})
                 raw = await asyncio.wait_for(socket.receive_text(),timeout=min(15,max(.1,deadline-time.monotonic())))
                 if len(raw)>2048:
                     raise ValueError("Invalid input")

@@ -25,6 +25,155 @@ from test_hosted_analytics import FakeClient,Registry
 
 
 class BrowserPolicyTests(unittest.TestCase):
+    def test_exact_skool_tracking_host_allows_background_requests_only(self):
+        self.assertIn('www.skool.com',BROWSER_HOSTS)
+        self.assertIn('ct.skool.com',BROWSER_HOSTS)
+        self.assertIn('017ae153ccc5.edge.sdk.awswaf.com',BROWSER_HOSTS)
+        for method,kind in (('GET','script'),('GET','image'),('GET','fetch'),('POST','fetch'),('POST','xhr'),('POST','ping')):
+            self.assertTrue(allowed_request('https://ct.skool.com/collect',method,kind))
+        for method,kind in (('GET','document'),('POST','document'),('PUT','xhr'),('GET','websocket')):
+            self.assertFalse(allowed_request('https://ct.skool.com/collect',method,kind))
+        for path in ('/auth/google','/auth/apple','/auth/login-with-code','/auth/login'):
+            self.assertFalse(allowed_request('https://ct.skool.com'+path,'POST','fetch'))
+
+    def test_required_external_services_and_nonexact_waf_hosts_remain_blocked(self):
+        for host in ('fonts.googleapis.com','js.stripe.com','sentry.io','example.ingest.sentry.io',
+                     'other.edge.sdk.awswaf.com','017ae153ccc5.edge.sdk.awswaf.com.evil.test',
+                     'ct.skool.com.evil.test'):
+            for resource in ('script','fetch','image','document'):
+                self.assertFalse(allowed_request('https://'+host+'/challenge.js','GET',resource),host)
+        for url in ('http://ct.skool.com/collect','https://ct.skool.com:444/collect',
+                    'https://user@ct.skool.com/collect'):
+            self.assertFalse(allowed_request(url,'POST','fetch'))
+
+    def test_dns_pins_requested_hosts_without_wildcard_egress(self):
+        with patch('catknows.hosted_browser_service.socket.getaddrinfo',
+            return_value=[(socket.AF_INET,socket.SOCK_STREAM,6,'',('93.184.216.34',443))]):
+            rules=public_host_rules()
+        for host in ('www.skool.com','ct.skool.com',WAF_HOST):
+            self.assertIn('MAP '+host+' 93.184.216.34',rules)
+        self.assertTrue(rules.endswith('MAP * ~NOTFOUND'))
+        self.assertNotIn('MAP *.edge',rules)
+
+    def test_allowed_host_still_obeys_path_method_and_resource_policy(self):
+        # Reproduce why the old hostname-only message cannot diagnose a loop.
+        self.assertFalse(allowed_request('https://www.skool.com/','GET','document'))
+        self.assertFalse(allowed_request('https://www.skool.com/_next/data/build/group.json','GET','fetch'))
+        self.assertFalse(allowed_request('https://'+WAF_HOST+'/other-endpoint','POST','xhr'))
+        self.assertTrue(allowed_request('https://www.skool.com/login','GET','document'))
+        self.assertTrue(allowed_request('https://'+WAF_HOST+'/inputs','GET','xhr'))
+
+    def test_temporary_block_diagnostic_redacts_query_userinfo_and_opaque_path(self):
+        from catknows.hosted_security import blocked_request
+        previous=logging.getLogRecordFactory();install_private_logging();output=io.StringIO()
+        handler=logging.StreamHandler(output);logger=logging.getLogger('stealth.hosted.blocked_request');logger.addHandler(handler)
+        try:
+            blocked_request('https://synthetic-user:synthetic-password@www.skool.com/_next/data/synthetic-token/synthetic-group.json?secret=synthetic-query#synthetic-fragment',
+                'GET','fetch')
+            value=output.getvalue()
+            self.assertIn('www.skool.com',value);self.assertIn('/_next/data/<redacted>/<redacted>',value)
+            self.assertIn('GET',value);self.assertIn('fetch',value)
+            for secret in ('synthetic-user','synthetic-password','synthetic-token','synthetic-group','synthetic-query','synthetic-fragment','https://','?'):
+                self.assertNotIn(secret,value)
+        finally:logger.removeHandler(handler);logging.setLogRecordFactory(previous)
+
+    def test_login_statuses_and_counts_stay_in_server_logs_once_per_change(self):
+        from catknows.hosted_browser_service import LoginDiagnostics
+        from catknows.auth import Session
+        previous=logging.getLogRecordFactory();install_private_logging();output=io.StringIO()
+        handler=logging.StreamHandler(output);logger=logging.getLogger('stealth.hosted.login_diagnostics');logger.addHandler(handler)
+        try:
+            diagnostics=LoginDiagnostics()
+            diagnostics.response('https://api2.skool.com/auth/login?secret=synthetic-query',200)
+            diagnostics.response('https://'+WAF_HOST+'/inputs?secret=synthetic-query',200)
+            diagnostics.blocked();diagnostics.failed()
+            session=Session('synthetic-cookie','synthetic-auth','synthetic-waf')
+            diagnostics.snapshot(session);diagnostics.snapshot(session)
+            value=output.getvalue()
+            self.assertEqual(len(value.splitlines()),1)
+            self.assertIn('"waf_status":200',value);self.assertIn('"blocked_requests":1',value)
+            self.assertIn('"failed_requests":1',value);self.assertIn('"login_status":200',value)
+            for secret in ('synthetic-query','synthetic-cookie','synthetic-auth','synthetic-waf','https://'):
+                self.assertNotIn(secret,value)
+        finally:logger.removeHandler(handler);logging.setLogRecordFactory(previous)
+
+    def test_diagnostic_loggers_reject_unbounded_or_secret_bearing_fields(self):
+        previous=logging.getLogRecordFactory();install_private_logging();output=io.StringIO()
+        handler=logging.StreamHandler(output)
+        login=logging.getLogger('stealth.hosted.login_diagnostics')
+        blocked=logging.getLogger('stealth.hosted.blocked_request')
+        login.addHandler(handler);blocked.addHandler(handler)
+        try:
+            login.warning({'waf_status':200,'login_status':'synthetic-secret','blocked_requests':True,
+                'failed_requests':-1,'headers':'synthetic-header','body':'synthetic-body'})
+            blocked.warning({'method':'synthetic-secret','resource_type':'fetch','host':'www.skool.com',
+                'path':'/inputs?token=synthetic-query','headers':'synthetic-header','cookie':'synthetic-cookie'})
+            lines=output.getvalue().splitlines()
+            self.assertEqual(json.loads(lines[0].split('=',1)[1]),{'waf_status':200})
+            context=json.loads(lines[1].split('=',1)[1])
+            self.assertEqual(set(context),{'method','resource_type','host','path'})
+            self.assertEqual(context['path'],'/<redacted>')
+            for value in ('synthetic-secret','synthetic-header','synthetic-body','synthetic-query','synthetic-cookie'):
+                self.assertNotIn(value,output.getvalue())
+        finally:
+            login.removeHandler(handler);blocked.removeHandler(handler);logging.setLogRecordFactory(previous)
+
+    def test_connect_html_and_javascript_have_no_member_debug_line(self):
+        from catknows.hosted_popup import PAGE,SCRIPT
+        from catknows.hosted_connect import PAGE as legacy_page,SCRIPT as legacy_script
+        for value in (PAGE,SCRIPT,legacy_page,legacy_script):
+            self.assertNotIn('id="diagnostics"',value)
+            self.assertNotIn('Security check HTTP',value)
+            self.assertNotIn('Blocked requests:',value)
+            self.assertNotIn('Failed requests:',value)
+            self.assertNotIn('v.diagnostics',value)
+
+    def test_actual_allowed_host_denial_emits_safe_request_context(self):
+        previous=logging.getLogRecordFactory();install_private_logging();output=io.StringIO()
+        handler=logging.StreamHandler(output);logger=logging.getLogger('stealth.hosted.blocked_request');logger.addHandler(handler)
+        try:
+            browser=LoginBrowser();page=SimpleNamespace();frame=SimpleNamespace(page=page);page.main_frame=frame;browser.page=page
+            route=SimpleNamespace(request=SimpleNamespace(url='https://www.skool.com/_next/data/opaque-build/opaque-group.json?token=synthetic-secret',
+                method='GET',resource_type='fetch',frame=frame),continue_=AsyncMock(),abort=AsyncMock())
+            asyncio.run(browser.route_request(route))
+            route.abort.assert_awaited_once_with('blockedbyclient');route.continue_.assert_not_awaited()
+            value=output.getvalue()
+            self.assertIn('"resource_type":"fetch"',value)
+            self.assertIn('"method":"GET"',value);self.assertIn('"host":"www.skool.com"',value)
+            for secret in ('synthetic-secret','opaque-build','opaque-group','?token='):
+                self.assertNotIn(secret,value)
+        finally:logger.removeHandler(handler);logging.setLogRecordFactory(previous)
+
+    def test_active_connect_stream_sends_frame_without_private_diagnostics(self):
+        case=popup_tests.PopupTests();case.setUp();self.addCleanup(case.doCleanups)
+        class Bridge:
+            def __init__(self):self.frames=0
+            def call(self,operation,job,command=None):
+                if operation!='command':return {'ok':True}
+                self.frames+=1
+                if self.frames==1:
+                    return {'frame':'synthetic-frame','diagnostics':{'waf_status':200,'blocked_requests':3,'failed_requests':2}}
+                return {'session':{'cookie_header':'synthetic-cookie=value','auth_token':'synthetic-auth','waf_token':'synthetic-waf'}}
+        from catknows.hosted_server import build_app
+        case.app=build_app(case.settings,oauth_provider=case.provider,browser_factory=Bridge,identity_reader=lambda _:case.identity)
+        async def check():
+            await case.begin()
+            status,_,_=await http(case.app,'/connect/start','POST',{},
+                {'origin':case.settings.public_origin,'x-stealth-csrf':'1','x-stealth-flow':case.flow,'cookie':case.cookie})
+            self.assertEqual(status,200)
+            queue=asyncio.Queue();messages=[]
+            for message in ({'type':'websocket.connect'},
+                {'type':'websocket.receive','text':json.dumps({'flow':case.flow})},
+                {'type':'websocket.receive','text':json.dumps({'type':'frame'})}):
+                await queue.put(message)
+            async def send(message):messages.append(message)
+            await case.app(dict(type='websocket',asgi={'version':'3.0'},scheme='wss',path='/connect/stream',
+                raw_path=b'/connect/stream',query_string=b'',headers=[(b'origin',case.settings.public_origin.encode()),
+                    (b'cookie',case.cookie.encode())],server=('mcp.example.test',443),client=('127.0.0.1',1),subprotocols=[]),queue.get,send)
+            frames=[json.loads(message['text'])for message in messages if message['type']=='websocket.send']
+            self.assertEqual(frames,[{'frame':'synthetic-frame'},{'ready':True}])
+        asyncio.run(check())
+
     def test_route_actually_aborts_social_codes_external_navigation_and_private_ips(self):
         browser=LoginBrowser();page=SimpleNamespace();main=SimpleNamespace(page=page);page.main_frame=main;browser.page=page
         urls=[('https://accounts.google.com/o/oauth2/auth','GET','document'),
