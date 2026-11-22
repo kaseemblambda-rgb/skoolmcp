@@ -42,6 +42,10 @@ def install_issuer_identification(app, provider, auth):
         auth.client_registration_options, auth.revocation_options,
         supports_identity_assertion=auth.identity_assertion_enabled)
     metadata.authorization_response_iss_parameter_supported = True
+    # DCR accepts public PKCE clients only; do not advertise SDK secret defaults.
+    metadata.token_endpoint_auth_methods_supported = ["none"]
+    if metadata.revocation_endpoint is not None:
+        metadata.revocation_endpoint_auth_methods_supported = ["none"]
     # Pydantic URL serialization is authoritative. Do not strip or append a slash.
     issuer = metadata.model_dump(mode="json", exclude_none=True)["issuer"]
     from mcp.shared.auth import ProtectedResourceMetadata
@@ -96,6 +100,14 @@ def install_issuer_identification(app, provider, auth):
                     break
             try:
                 fields = json.loads(body)
+                if isinstance(fields, dict) and "token_endpoint_auth_method" not in fields:
+                    # The SDK otherwise defaults omission to client_secret_post.
+                    fields["token_endpoint_auth_method"] = "none"
+                    body = json.dumps(fields, separators=(",", ":")).encode("utf-8")
+                    if len(body) > 65536:
+                        return await JSONResponse({"error":"invalid_client_metadata"}, status_code=413)(scope, receive, send)
+                    scope = {**scope, "headers": [(key, value) for key, value in scope["headers"]
+                        if key.lower() != b"content-length"] + [(b"content-length", str(len(body)).encode("ascii"))]}
                 redirects = fields.get("redirect_uris") if isinstance(fields, dict) else None
                 approved = (isinstance(fields, dict) and "client_secret" not in fields
                     and fields.get("token_endpoint_auth_method") == "none"

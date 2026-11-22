@@ -135,6 +135,8 @@ class IssuerIdentificationTests(unittest.TestCase):
                 client_registration_options=ClientRegistrationOptions(enabled=True,valid_scopes=['mcp:read'],default_scopes=['mcp:read']),
                 revocation_options=RevocationOptions(enabled=True))
             expected = build_metadata(auth.issuer_url,None,auth.client_registration_options,auth.revocation_options).model_dump(mode='json',exclude_none=True)
+            expected['token_endpoint_auth_methods_supported'] = ['none']
+            expected['revocation_endpoint_auth_methods_supported'] = ['none']
             self.assertEqual({k:v for k,v in actual.items() if k!='authorization_response_iss_parameter_supported'},expected)
         asyncio.run(check())
 
@@ -162,6 +164,95 @@ class IssuerIdentificationTests(unittest.TestCase):
 
     def test_complete_claude_dcr_pkce_consent_token_and_mcp_flow(self):
         asyncio.run(self.complete(CLAUDE))
+
+    def test_every_advertised_method_registers_for_claude_and_chatgpt(self):
+        async def check():
+            metadata,_ = await self.metadata()
+            for name in ('token_endpoint_auth_methods_supported','revocation_endpoint_auth_methods_supported'):
+                self.assertEqual(metadata[name],['none'])
+                for method in metadata[name]:
+                    for callback in (CLAUDE,CHATGPT):
+                        fields = self.metadata_request(callback)
+                        fields['token_endpoint_auth_method'] = method
+                        status,_,body = await http(self.app,'/register','POST',fields,{'content-type':'application/json'})
+                        self.assertEqual(status,201)
+                        data = json.loads(body)
+                        self.assertEqual(data['token_endpoint_auth_method'],'none')
+                        self.assertIsNone(data.get('client_secret'))
+                        self.assertIsNone(data.get('client_secret_expires_at'))
+        asyncio.run(check())
+
+    def test_omitted_method_defaults_to_none_for_both_clients(self):
+        async def check():
+            for callback in (CLAUDE,CHATGPT):
+                fields = self.metadata_request(callback)
+                del fields['token_endpoint_auth_method']
+                raw = json.dumps(fields).encode()
+                status,_,body = await http(self.app,'/register','POST',raw,
+                    {'content-type':'application/json','content-length':str(len(raw))})
+                self.assertEqual(status,201)
+                data = json.loads(body)
+                self.assertEqual(data['token_endpoint_auth_method'],'none')
+                self.assertIsNone(data.get('client_secret'))
+                stored = self.flow.store.clients[data['client_id']]
+                self.assertEqual(stored['token_endpoint_auth_method'],'none')
+                self.assertNotIn('client_secret',stored)
+        asyncio.run(check())
+
+    def test_explicit_secret_unknown_and_null_methods_still_rejected(self):
+        async def check():
+            for method in ('client_secret_post','client_secret_basic','private_key_jwt','unknown','',None,False):
+                fields = self.metadata_request(CLAUDE)
+                fields['token_endpoint_auth_method'] = method
+                before = dict(self.flow.store.clients)
+                status,_,_ = await http(self.app,'/register','POST',fields,{'content-type':'application/json'})
+                self.assertEqual(status,400)
+                self.assertEqual(self.flow.store.clients,before)
+        asyncio.run(check())
+
+    def test_omitted_method_cannot_bypass_exact_redirect_allowlist(self):
+        async def check():
+            for redirects in (['https://unlisted.example/callback'],[CLAUDE+'/'],
+                ['https://chatgpt.com/connector/oauth/abc'],[CHATGPT+'/'],
+                [CHATGPT.replace('https:','http:')],[CLAUDE,'https://unlisted.example/callback']):
+                fields = self.metadata_request(CLAUDE)
+                del fields['token_endpoint_auth_method']
+                fields['redirect_uris'] = redirects
+                before = dict(self.flow.store.clients)
+                status,_,_ = await http(self.app,'/register','POST',fields,{'content-type':'application/json'})
+                self.assertEqual(status,400)
+                self.assertEqual(self.flow.store.clients,before)
+        asyncio.run(check())
+
+    def test_omitted_method_cannot_accept_any_client_secret_field(self):
+        async def check():
+            for value in ('synthetic-client-secret',None,''):
+                fields = self.metadata_request(CLAUDE)
+                del fields['token_endpoint_auth_method']
+                fields['client_secret'] = value
+                before = dict(self.flow.store.clients)
+                status,_,_ = await http(self.app,'/register','POST',fields,{'content-type':'application/json'})
+                self.assertEqual(status,400)
+                self.assertEqual(self.flow.store.clients,before)
+        asyncio.run(check())
+
+    def test_complete_claude_flow_with_omitted_registration_method(self):
+        original = self.metadata_request
+        def omitted(callback):
+            fields = original(callback)
+            del fields['token_endpoint_auth_method']
+            return fields
+        with patch.object(self,'metadata_request',side_effect=omitted):
+            asyncio.run(self.complete(CLAUDE))
+
+    def test_complete_chatgpt_flow_with_omitted_registration_method(self):
+        original = self.metadata_request
+        def omitted(callback):
+            fields = original(callback)
+            del fields['token_endpoint_auth_method']
+            return fields
+        with patch.object(self,'metadata_request',side_effect=omitted):
+            asyncio.run(self.complete(CHATGPT))
 
     def test_deny_for_both_clients_has_exact_issuer_and_saves_nothing(self):
         async def check():
