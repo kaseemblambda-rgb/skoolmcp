@@ -247,6 +247,8 @@ class SkoolOAuthProvider(OAuthAuthorizationServerProvider):
             access_hash=hashed(access), refresh_hash=hashed(refresh))
         if not result:
             raise TokenError("invalid_grant", "Authorization expired or already used")
+        from .hosted_security import login_lifecycle
+        login_lifecycle("oauth_complete")
         return OAuthToken(access_token=access, refresh_token=refresh, expires_in=300, scope="mcp:read")
 
     async def load_refresh_token(self, client, refresh_token):

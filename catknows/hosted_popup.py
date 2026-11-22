@@ -13,7 +13,7 @@ from .auth import Session
 from .hosted_connect import BrowserBridge, SCRIPT as KEYBOARD_SCRIPT
 from .hosted_keys import keyring, encrypt_session
 from .hosted_oauth import hashed, secret, skool_identity, authorization_redirect
-from .hosted_security import RateBudget, SECURITY_HEADERS, client_ip
+from .hosted_security import RateBudget, SECURITY_HEADERS, client_ip, login_lifecycle
 
 COOKIE = "__Host-stealth_oauth"
 MANAGEMENT_COOKIE = "__Host-stealth_manage"
@@ -206,6 +206,7 @@ def routes(settings, provider, identity_reader=skool_identity, bridge_factory=Br
         args = None
         claimed = False
         ready = False
+        stage = "binding"
         await socket.accept()
         job = secrets.token_hex(32)
         try:
@@ -218,15 +219,25 @@ def routes(settings, provider, identity_reader=skool_identity, bridge_factory=Br
                 raise ValueError("Login already started")
             active.add(key)
             claimed = True
+            login_lifecycle("stream_started")
+            stage = "browser"
             bridge = bridge_factory()
             await asyncio.to_thread(bridge.call,"start",job)
             deadline = time.monotonic()+160
             command = {"type":"frame"}
             while time.monotonic()<deadline:
+                stage = "binding"
                 if not await provider.call("flow_get",**args):
                     raise ValueError("Login ended")
+                stage = "browser"
+                login_lifecycle("browser_command="+("frame" if command.get("type")=="frame" else "input"))
                 data = await asyncio.to_thread(bridge.call,"command",job,command)
+                if "error" in data:
+                    login_lifecycle("browser_reply=error")
+                    raise ValueError("Login browser unavailable")
                 if "session" in data:
+                    login_lifecycle("session_received")
+                    stage = "identity"
                     session = Session(**data.pop("session"))
                     if not session.is_valid or not session.waf_token:
                         raise ValueError("Skool authentication unavailable")
@@ -234,25 +245,41 @@ def routes(settings, provider, identity_reader=skool_identity, bridge_factory=Br
                     # Never accept an identity from a browser command or OAuth client.
                     if not isinstance(skool_id,str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}",skool_id):
                         raise ValueError("Invalid Skool identity")
+                    stage = "membership"
                     account = await provider.call("account",skool_user_id=skool_id)
                     if not account or await provider.call("paid",account_id=account["id"]) is not True:
+                        login_lifecycle("membership_check=not_paid")
                         await socket.send_json({"error":"Paid SFC membership is required."})
                         return
+                    login_lifecycle("membership_check=paid")
+                    stage = "consent"
                     version,keys = keyring()
                     encrypted = encrypt_session(account["id"],session,version,keys[version])
                     session = None
                     if await provider.call("flow_ready",**args,account_id=account["id"],encrypted_session=encrypted) is not True:
                         raise ValueError("Login invalidated")
+                    login_lifecycle("consent_ready")
                     await socket.send_json({"ready":True})
                     ready = True
                     return
+                login_lifecycle("browser_reply=frame")
                 await socket.send_json({"frame":data["frame"]})
+                stage = "input"
                 raw = await asyncio.wait_for(socket.receive_text(),timeout=min(15,max(.1,deadline-time.monotonic())))
                 if len(raw)>2048:
                     raise ValueError("Invalid input")
                 command=json.loads(raw)
         except (Exception,asyncio.CancelledError):
-            pass
+            login_lifecycle("stream_failed stage="+stage)
+            if stage=="browser":
+                login_lifecycle("browser_command_failed")
+            elif stage=="membership":
+                login_lifecycle("membership_check=error")
+            if claimed and not ready:
+                try:
+                    await socket.send_json({"error":"Skool sign-in could not finish. Start Connect again from your AI app."})
+                except Exception:
+                    pass
         finally:
             if claimed:
                 active.discard(key)

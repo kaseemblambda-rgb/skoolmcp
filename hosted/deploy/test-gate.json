@@ -16,6 +16,6 @@
     "test_hosted_login_completion"
   ],
   "scope": "Hosted runtime and synthetic container checks only. Mac exporter, scheduler, reconciliation and updater suites are excluded.",
-  "expected_tests": 196,
+  "expected_tests": 217,
   "allow_skips": false
 }

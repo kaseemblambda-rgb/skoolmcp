@@ -295,7 +295,7 @@ const late=node('Sign in with Google');nodes.push(late);observer();assert.equal(
             await self.begin();self.store.flows[self.flow]['expires']=0
             self.assertEqual(await self.stream(),[]);self.assertEqual(self.store.sessions,{})
             await self.begin();self.identity='../../forged'
-            self.assertEqual(await self.stream(),[]);self.assertEqual(self.store.accounts,{})
+            self.assertEqual(await self.stream(),[{"error":"Skool sign-in could not finish. Start Connect again from your AI app."}]);self.assertEqual(self.store.accounts,{})
         asyncio.run(check())
 
     def test_popup_keyboard_consent_and_no_second_window(self):

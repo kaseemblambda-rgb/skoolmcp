@@ -15,6 +15,8 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from .hosted_security import login_lifecycle
+
 LOGIN="https://www.skool.com/login"
 SESSION_CAPTURE_TIMEOUT=2.0
 
@@ -139,6 +141,7 @@ class LoginBrowser:
         self.page=None
         self._login_succeeded=False
         self._completion=None
+        self._completion_started=asyncio.Event()
         self._navigation_denied=False
         self._closed=False
 
@@ -161,6 +164,7 @@ class LoginBrowser:
         try:
             if (self._completion is None and response.url==response.request.url
                 and self.password_request(response.request)):
+                login_lifecycle("login_post_status="+str(response.status))
                 self._login_succeeded=response.status==200
         except Exception:
             pass  # Missing/foreign request context is never authentication evidence.
@@ -177,30 +181,43 @@ class LoginBrowser:
     async def capture_session(self):
         """Bound the cookie-settling race; never return an incomplete session."""
         deadline=asyncio.get_running_loop().time()+SESSION_CAPTURE_TIMEOUT
+        reason="timeout"
         try:
             while not self._closed and not self._navigation_denied:
                 remaining=deadline-asyncio.get_running_loop().time()
                 if remaining<=0:
                     break
                 session=await asyncio.wait_for(self.read_session(),timeout=remaining)
+                reason="no_auth" if not session.is_valid else "no_waf"
                 if session.is_valid and session.waf_token:
+                    login_lifecycle("completion_ok")
                     return session
                 await asyncio.sleep(min(.05,remaining))
         except asyncio.CancelledError:
+            login_lifecycle("completion_failed reason=closed")
             raise
         except Exception:
-            pass
+            reason="timeout"  # Cookie API failures never contribute raw exception text.
+        if self._closed:
+            reason="closed"
+        elif self._navigation_denied:
+            reason="denied"
+        login_lifecycle("completion_failed reason="+reason)
         raise ValueError("Skool session unavailable") from None
 
     def begin_completion(self):
         if self._closed or self._navigation_denied or not self._login_succeeded:
             raise ValueError("Skool login unavailable")
         if self._completion is None:
+            login_lifecycle("completion_started")
             self._completion=asyncio.create_task(self.capture_session())
+            self._completion_started.set()
         return self._completion
 
     def session_result(self, session):
         if self._closed or self._navigation_denied or not session.is_valid or not session.waf_token:
+            reason="closed" if self._closed else "denied" if self._navigation_denied else "no_auth" if not session.is_valid else "no_waf"
+            login_lifecycle("completion_failed reason="+reason)
             raise ValueError("Skool login unavailable")
         self.network.log()
         return {"session":{"cookie_header":session.cookie_header,
@@ -325,31 +342,37 @@ class LoginBrowser:
         elif kind!="frame":
             raise ValueError("Invalid command")
 
+    async def until_completion(self, operation):
+        """A latched redirect interrupts slow input/screenshots, not just the next poll."""
+        action=asyncio.create_task(operation)
+        signal=asyncio.create_task(self._completion_started.wait())
+        try:
+            await asyncio.wait((action,signal),return_when=asyncio.FIRST_COMPLETED)
+            if self._completion is None:
+                return await action
+            # command() awaits capture outside any Playwright exception handler.
+            return None
+        finally:
+            for task in (action,signal):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(action,signal,return_exceptions=True)
+
     async def command(self, command):
         if self._closed or self._navigation_denied:
             raise ValueError("Skool login unavailable")
         if self._completion is not None:
             return self.session_result(await self._completion)
-        try:
-            await self.interact(command)
-        except Exception:
-            if self._completion is None:
-                raise
-            # Playwright may report an interrupted click/load after the local 204.
-            # Only a genuine, already latched success can switch to cookie capture.
+        await self.until_completion(self.interact(command))
         if self._completion is not None:
             return self.session_result(await self._completion)
-        session=await self.read_session()
+        session=await self.until_completion(self.read_session())
+        if self._completion is not None:
+            return self.session_result(await self._completion)
         self.network.log()
         if session.is_valid and session.waf_token:
             return self.session_result(session)
-        if self._completion is not None:
-            return self.session_result(await self._completion)
-        try:
-            frame=await self.page.screenshot(type="jpeg",quality=65)
-        except Exception:
-            if self._completion is None:
-                raise
+        frame=await self.until_completion(self.page.screenshot(type="jpeg",quality=65))
         if self._completion is not None:
             return self.session_result(await self._completion)
         challenge=any(urlsplit(frame.url).hostname=="challenges.cloudflare.com"
@@ -447,6 +470,7 @@ def build_browser_app(factory=LoginBrowser, secret=None):
                 await destroy(job)
             return reply(result,headers={"Cache-Control":"no-store"})
         except Exception:
+            login_lifecycle("browser_command_failed")
             await destroy(data.get("job") if isinstance(locals().get("data"),dict) else None)
             return reply({"error":"Login browser unavailable"},status_code=400)
 

@@ -17,6 +17,8 @@ def install_private_logging():
             import re
             host = record.msg if isinstance(record.msg,str) and re.fullmatch(r"[A-Za-z0-9.-]{1,253}",record.msg) else "invalid-host"
             record.msg = "blocked_host="+host
+        elif record.name == "stealth.hosted.login_lifecycle":
+            record.msg = safe_login_lifecycle(record.msg)
         elif record.name == "stealth.hosted.login_diagnostics":
             import json
             record.msg = "login_diagnostics="+json.dumps(safe_login_diagnostics(record.msg),sort_keys=True,separators=(",",":"))
@@ -48,6 +50,29 @@ def audit(event):
 def blocked_host(host):
     """The only dynamic log value is a parsed hostname, never a URL or payload."""
     logging.getLogger("stealth.hosted.blocked_host").warning(host)
+
+
+def safe_login_lifecycle(value):
+    """A finite server-only vocabulary; no caller data or exception text survives."""
+    fixed={"completion_started","completion_ok","session_received","consent_ready","oauth_complete",
+        "stream_started","browser_command_failed"}
+    fixed.update("completion_failed reason="+v for v in ("timeout","no_auth","no_waf","closed","denied"))
+    fixed.update("membership_check="+v for v in ("paid","not_paid","error"))
+    fixed.update("browser_command="+v for v in ("frame","input"))
+    fixed.update("browser_reply="+v for v in ("frame","error"))
+    fixed.update("stream_failed stage="+v for v in ("binding","browser","identity","membership","consent","input"))
+    if isinstance(value,str):
+        if value in fixed:
+            return value
+        if value.startswith("login_post_status=") and value[len("login_post_status="):] in {str(n) for n in range(100,600)}:
+            return value
+    return "login_lifecycle_invalid"
+
+
+def login_lifecycle(event):
+    logger=logging.getLogger("stealth.hosted.login_lifecycle")
+    logger.setLevel(logging.INFO)
+    logger.info(safe_login_lifecycle(event))
 
 
 def safe_login_diagnostics(values):

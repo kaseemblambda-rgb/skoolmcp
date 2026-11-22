@@ -306,3 +306,245 @@ class CompletionFlowTests(unittest.TestCase):
 
     def test_same_success_redirect_cannot_bypass_unpaid_membership_denial(self):
         asyncio.run(self.flow(False))
+
+
+class LifecycleTests(unittest.TestCase):
+    def run_race(self,step,cookies=True):
+        async def check():
+            worker=browser();worker.context.cookies.return_value=[]
+            started=asyncio.Event();cancelled=asyncio.Event()
+            async def stuck(*args,**kwargs):
+                started.set()
+                try:await asyncio.Event().wait()
+                finally:cancelled.set()
+            if step=='input':worker.page.mouse.click.side_effect=stuck
+            elif step=='cookies':worker.context.cookies.side_effect=stuck
+            else:worker.page.screenshot.side_effect=stuck
+            command=asyncio.create_task(worker.command({'type':'click','x':1,'y':1} if step=='input' else {'type':'frame'}))
+            await asyncio.wait_for(started.wait(),1)
+            worker.context.cookies.side_effect=None
+            worker.context.cookies.return_value=attach(browser()).context.cookies.return_value if cookies else []
+            worker.observe_response(response(worker));await worker.route_request(root_route(worker))
+            if cookies:
+                value=await asyncio.wait_for(command,.5)
+                self.assertIn('session',value)
+            else:
+                with self.assertRaisesRegex(ValueError,'Skool session unavailable'):
+                    await asyncio.wait_for(command,.5)
+            self.assertTrue(cancelled.is_set());await worker.close()
+        asyncio.run(check())
+
+    def test_completion_interrupts_hung_input(self):self.run_race('input')
+    def test_completion_interrupts_hung_screenshot(self):self.run_race('screenshot')
+    def test_completion_interrupts_pre_redirect_cookie_read(self):self.run_race('cookies')
+    def test_failed_capture_interrupts_hung_screenshot_without_secret_exception(self):
+        with patch('catknows.hosted_browser_service.SESSION_CAPTURE_TIMEOUT',.01):self.run_race('screenshot',False)
+
+    def test_poll_cancellation_drains_action_and_waiter(self):
+        async def check():
+            worker=browser();worker.context.cookies.return_value=[]
+            started=asyncio.Event();stopped=asyncio.Event()
+            async def screenshot(*args,**kwargs):
+                started.set()
+                try:await asyncio.Event().wait()
+                finally:stopped.set()
+            worker.page.screenshot.side_effect=screenshot
+            command=asyncio.create_task(worker.command({'type':'frame'}));await started.wait()
+            command.cancel()
+            with self.assertRaises(asyncio.CancelledError):await command
+            self.assertTrue(stopped.is_set());self.assertIsNone(worker._completion)
+            await worker.close();await asyncio.sleep(0)
+            self.assertEqual([t for t in asyncio.all_tasks()if t is not asyncio.current_task()],[])
+        asyncio.run(check())
+
+    def capture_logs(self,mode):
+        async def check():
+            worker=browser()
+            if mode=='no_auth':worker.context.cookies.return_value=[{'name':'aws-waf-token','value':'synthetic-private-waf'}]
+            elif mode=='no_waf':worker.context.cookies.return_value=[{'name':'auth_token','value':'synthetic-private-auth'}]
+            elif mode in ('timeout','closed'):
+                async def stuck(*args):await asyncio.Event().wait()
+                worker.context.cookies.side_effect=stuck
+            elif mode=='error':worker.context.cookies.side_effect=RuntimeError('synthetic-private-cookie@example.test')
+            with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as log:
+                worker.observe_response(response(worker));await worker.route_request(root_route(worker))
+                if mode=='closed':
+                    await asyncio.sleep(0);await worker.close()
+                else:
+                    if mode=='denied':worker._navigation_denied=True
+                    if mode=='ok':self.assertIn('session',await worker.command({'type':'frame'}))
+                    else:
+                        with self.assertRaisesRegex(ValueError,'Skool session unavailable'):
+                            await worker.command({'type':'frame'}) if mode!='denied' else await worker._completion
+                    await worker.close()
+            output='\n'.join(log.output)
+            self.assertIn('login_post_status=200',output);self.assertIn('completion_started',output)
+            expected='completion_ok' if mode=='ok' else 'completion_failed reason='+('timeout' if mode=='error' else mode)
+            self.assertIn(expected,output)
+            for private in ('synthetic-private','synthetic-auth','synthetic-waf','cookie@example','https://','Traceback'):
+                self.assertNotIn(private,output)
+        with patch('catknows.hosted_browser_service.SESSION_CAPTURE_TIMEOUT',.01):asyncio.run(check())
+
+    def test_success_lifecycle_logged(self):self.capture_logs('ok')
+    def test_no_auth_lifecycle_logged(self):self.capture_logs('no_auth')
+    def test_no_waf_lifecycle_logged(self):self.capture_logs('no_waf')
+    def test_cookie_timeout_lifecycle_logged(self):self.capture_logs('timeout')
+    def test_cookie_error_lifecycle_never_logs_exception(self):self.capture_logs('error')
+    def test_closed_lifecycle_logged(self):self.capture_logs('closed')
+    def test_denied_lifecycle_logged(self):self.capture_logs('denied')
+
+    def test_lifecycle_factory_removes_arbitrary_arguments_tracebacks_and_values(self):
+        import io,logging
+        from catknows.hosted_security import install_private_logging,login_lifecycle,safe_login_lifecycle
+        old=logging.getLogRecordFactory();stream=io.StringIO();handler=logging.StreamHandler(stream)
+        logger=logging.getLogger('stealth.hosted.login_lifecycle');logger.addHandler(handler)
+        try:
+            install_private_logging()
+            for value in ('completion_started','completion_ok','session_received','membership_check=paid','membership_check=not_paid',
+                'membership_check=error','oauth_complete','login_post_status=403','completion_failed reason=no_waf'):
+                login_lifecycle(value);self.assertIn(value,stream.getvalue())
+            for value in ('login_post_status=200 private@example.test','completion_failed reason=synthetic-secret',{'secret':'synthetic-secret'},None):
+                self.assertEqual(safe_login_lifecycle(value),'login_lifecycle_invalid');login_lifecycle(value)
+            try:raise ValueError('synthetic-private-password')
+            except ValueError:logger.exception('completion_ok',extra={})
+            logger.info('session_received %s','synthetic-private-token')
+            for value in ('synthetic-secret','synthetic-private','private@example.test','Traceback'):
+                self.assertNotIn(value,stream.getvalue())
+        finally:
+            logger.removeHandler(handler);logging.setLogRecordFactory(old)
+
+
+class StreamLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.case=popup.PopupTests();self.case.setUp();self.addCleanup(self.case.doCleanups)
+
+    async def gateway(self,behavior='poll',paid=True):
+        case=self.case
+        if not paid:case.store.paid.clear()
+        calls=[]
+        class Bridge:
+            def call(self,op,job,command=None):
+                if op=='command':
+                    calls.append(command)
+                    if behavior=='raise':raise ValueError('synthetic-private-cookie-and-token')
+                    if behavior=='error':return {'error':'synthetic-private-cookie-and-token'}
+                    if len(calls)==1:return {'frame':'synthetic-frame'}
+                    return {'session':{'cookie_header':'synthetic-cookie=value','auth_token':'synthetic-auth','waf_token':'synthetic-waf'}}
+                return {'ok':True}
+        if behavior=='identity':
+            def identity(_):raise RuntimeError('synthetic-private-identity')
+        else:identity=lambda _:case.identity
+        if behavior=='membership':
+            original=case.store.call
+            def call(op,**kwargs):
+                if op=='paid':raise RuntimeError('synthetic-private-membership')
+                return original(op,**kwargs)
+            case.store.call=call
+        case.app=build_app(case.settings,oauth_provider=case.provider,browser_factory=Bridge,identity_reader=identity)
+        queue=asyncio.Queue();messages=[]
+        async def send(value):
+            messages.append(value)
+            if value['type']=='websocket.send' and 'frame' in json.loads(value['text']):
+                await queue.put({'type':'websocket.receive','text':json.dumps({'type':'frame'})})
+        with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+            async with case.app.router.lifespan_context(case.app):
+                await case.begin()
+                await popup.http(case.app,'/connect/start','POST',{},
+                    {'origin':case.settings.public_origin,'x-stealth-csrf':'1','x-stealth-flow':case.flow,'cookie':case.cookie})
+                await queue.put({'type':'websocket.connect'})
+                await queue.put({'type':'websocket.receive','text':json.dumps({'flow':case.flow})})
+                await case.app(dict(type='websocket',asgi={'version':'3.0'},scheme='wss',path='/connect/stream',raw_path=b'/connect/stream',query_string=b'',
+                    headers=[(b'origin',case.settings.public_origin.encode()),(b'cookie',case.cookie.encode())],
+                    server=('mcp.example.test',443),client=('127.0.0.1',1),subprotocols=[]),queue.get,send)
+        output='\n'.join(logs.output)
+        values=[json.loads(m['text'])for m in messages if m['type']=='websocket.send']
+        self.assertNotIn('synthetic-private',output+json.dumps(values));self.assertNotIn('synthetic-cookie',output+json.dumps(values))
+        return output,values,calls
+
+    def test_gateway_continues_frame_polls_until_session_then_checks_paid(self):
+        async def check():
+            output,values,calls=await self.gateway()
+            self.assertEqual(calls,[{'type':'frame'},{'type':'frame'}]);self.assertEqual(values[-1],{'ready':True})
+            for event in ('stream_started','browser_command=frame','browser_reply=frame','session_received','membership_check=paid','consent_ready'):
+                self.assertIn(event,output)
+            self.assertNotIn('oauth_complete',output)  # Not complete until token exchange.
+        asyncio.run(check())
+
+    def test_gateway_unpaid_session_is_denied_and_logged(self):
+        async def check():
+            output,values,_=await self.gateway(paid=False)
+            self.assertIn('session_received',output);self.assertIn('membership_check=not_paid',output)
+            self.assertEqual(values[-1],{'error':'Paid SFC membership is required.'});self.assertEqual(self.case.store.flows,{})
+        asyncio.run(check())
+
+    def test_gateway_bridge_exception_is_logged_and_member_sees_generic_error(self):
+        async def check():
+            output,values,_=await self.gateway('raise')
+            self.assertIn('browser_command_failed',output);self.assertIn('stream_failed stage=browser',output)
+            self.assertIn('error',values[-1]);self.assertEqual(self.case.store.flows,{})
+        asyncio.run(check())
+
+    def test_gateway_error_reply_is_logged_and_member_sees_generic_error(self):
+        async def check():
+            output,values,_=await self.gateway('error');self.assertIn('browser_reply=error',output)
+            self.assertIn('error',values[-1]);self.assertEqual(self.case.store.flows,{})
+        asyncio.run(check())
+
+    def test_gateway_identity_failure_is_logged_without_claiming_membership_check(self):
+        async def check():
+            output,values,_=await self.gateway('identity');self.assertIn('stream_failed stage=identity',output)
+            self.assertNotIn('membership_check=',output);self.assertIn('error',values[-1]);self.assertEqual(self.case.store.flows,{})
+        asyncio.run(check())
+
+    def test_gateway_membership_error_is_logged_and_denied(self):
+        async def check():
+            output,values,_=await self.gateway('membership');self.assertIn('membership_check=error',output)
+            self.assertIn('error',values[-1]);self.assertEqual(self.case.store.flows,{})
+        asyncio.run(check())
+
+
+    def test_oauth_complete_only_after_code_exchange_not_consent(self):
+        async def check():
+            case=self.case
+            with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+                async with case.app.router.lifespan_context(case.app):
+                    await case.begin();self.assertEqual(await case.stream(),[{'ready':True}])
+                    status,_,body=await case.decide();self.assertEqual(status,200)
+                    self.assertNotIn('oauth_complete','\n'.join(logs.output))
+                    query=parse_qs(urlsplit(json.loads(body)['redirect']).query)
+                    fields=dict(grant_type='authorization_code',client_id=case.client.client_id,
+                        code=query['code'][0],code_verifier=case.verifier,redirect_uri=case.callback,resource=case.settings.resource)
+                    status,_,_=await popup.http(case.app,'/token','POST',urlencode(fields).encode(),
+                        {'content-type':'application/x-www-form-urlencoded'})
+                    self.assertEqual(status,200)
+                    self.assertEqual(sum('oauth_complete' in line for line in logs.output),1)
+                    status,_,_=await popup.http(case.app,'/token','POST',urlencode(fields).encode(),
+                        {'content-type':'application/x-www-form-urlencoded'})
+                    self.assertEqual(status,400)
+                    self.assertEqual(sum('oauth_complete' in line for line in logs.output),1)
+        asyncio.run(check())
+
+
+class PrivateCompletionFailureTests(unittest.TestCase):
+    def test_capture_failure_returns_fixed_error_and_destroys_private_browser(self):
+        async def check():
+            created=[]
+            class Worker(LoginBrowser):
+                async def start(self):attach(self);self.context.cookies.return_value=[];created.append(self)
+                async def command(self,value):
+                    self.observe_response(response(self));await self.route_request(root_route(self))
+                    return await super().command(value)
+            secret='synthetic-private-browser-secret'
+            app=build_browser_app(Worker,secret)
+            async with app.router.lifespan_context(app):
+                status,_=await private_request(app,'/job',{'operation':'start','job':'a'*64},{'x-browser-secret':secret})
+                self.assertEqual(status,200)
+                with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+                    status,messages=await private_request(app,'/job',{'operation':'command','job':'a'*64,'command':{'type':'frame'}},
+                        {'x-browser-secret':secret})
+                self.assertEqual(status,400)
+                self.assertEqual(json.loads(b''.join(m.get('body',b'')for m in messages)),{'error':'Login browser unavailable'})
+                self.assertIn('completion_failed reason=no_auth','\n'.join(logs.output))
+                self.assertIn('browser_command_failed','\n'.join(logs.output))
+                self.assertTrue(created[0]._closed);self.assertIsNone(created[0]._completion)
+        with patch('catknows.hosted_browser_service.SESSION_CAPTURE_TIMEOUT',.01):asyncio.run(check())
