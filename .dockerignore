@@ -37,3 +37,6 @@
 !hosted/deploy/probe/tls.py
 !hosted/deploy/requirements-browser.txt
 !hosted/deploy/requirements-gateway.txt
+!hosted/deploy/certs/
+!hosted/deploy/certs/supabase-prod-ca-2021.crt
+!hosted/deploy/certs/supabase-prod-ca-2021.crt.sha256

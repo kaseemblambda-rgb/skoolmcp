@@ -23,6 +23,112 @@ from .hosted_security import ReadOnlyTransport, RateBudget
 authorization_browser = ContextVar("stealth_authorization_browser", default=None)
 authorization_source = ContextVar("stealth_authorization_source", default=None)
 
+
+def authorization_redirect(provider, redirect_uri, **params):
+    """Use the AS metadata's serialized issuer verbatim, never a rebuilt origin."""
+    from mcp.server.auth.provider import construct_redirect_uri
+    issuer = provider.authorization_issuer
+    if not isinstance(issuer, str) or not issuer:
+        raise ValueError("Authorization issuer unavailable")
+    return construct_redirect_uri(redirect_uri, **params, iss=issuer)
+
+
+def install_issuer_identification(app, provider, auth):
+    """Gateway-local adaptation of pinned SDK metadata and authorize responses."""
+    from mcp.server.auth.routes import build_metadata, cors_middleware
+    from mcp.server.auth.handlers.metadata import MetadataHandler
+    from urllib.parse import parse_qsl, urlencode, urlunsplit
+    metadata = build_metadata(auth.issuer_url, auth.service_documentation_url,
+        auth.client_registration_options, auth.revocation_options,
+        supports_identity_assertion=auth.identity_assertion_enabled)
+    metadata.authorization_response_iss_parameter_supported = True
+    # Pydantic URL serialization is authoritative. Do not strip or append a slash.
+    issuer = metadata.model_dump(mode="json", exclude_none=True)["issuer"]
+    from mcp.shared.auth import ProtectedResourceMetadata
+    resource_metadata = ProtectedResourceMetadata(resource=auth.resource_server_url,
+        authorization_servers=[auth.issuer_url], scopes_supported=auth.required_scopes)
+    if resource_metadata.model_dump(mode="json")["authorization_servers"] != [issuer]:
+        raise ValueError("Authorization metadata issuer mismatch")
+    if getattr(provider, "authorization_issuer", issuer) != issuer:
+        raise ValueError("Authorization provider issuer mismatch")
+    provider.authorization_issuer = issuer
+
+    class IssuerResponse:
+        def __init__(self, downstream):
+            self.downstream = downstream
+        async def __call__(self, scope, receive, send):
+            async def identified(message):
+                if message["type"] == "http.response.start" and message["status"] in (302, 303, 307, 308):
+                    headers = []
+                    for name, value in message["headers"]:
+                        if name.lower() == b"location":
+                            uri = urlsplit(value.decode("latin-1"))
+                            fields = parse_qsl(uri.query, keep_blank_values=True)
+                            # SDK has already validated the client + exact registered
+                            # redirect before generating a code/error callback. Its
+                            # internal /connect/skool#ticket redirect stays untouched.
+                            if any(key in ("code", "error") for key, _ in fields):
+                                fields = [(key, val) for key, val in fields if key != "iss"]
+                                fields.append(("iss", issuer))
+                                value = urlunsplit(uri._replace(query=urlencode(fields))).encode("latin-1")
+                        headers.append((name, value))
+                    message = {**message, "headers": headers}
+                await send(message)
+            await self.downstream(scope, receive, identified)
+
+    class PublicRegistration:
+        """Reject raw secrets/normalized callback variants before SDK extra filtering."""
+        def __init__(self, downstream):
+            self.downstream = downstream
+        async def __call__(self, scope, receive, send):
+            if scope["method"] != "POST":
+                return await self.downstream(scope, receive, send)
+            from starlette.responses import JSONResponse
+            body = bytearray()
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    return
+                body.extend(message.get("body", b""))
+                if len(body) > 65536:
+                    return await JSONResponse({"error":"invalid_client_metadata"}, status_code=413)(scope, receive, send)
+                if not message.get("more_body", False):
+                    break
+            try:
+                fields = json.loads(body)
+                redirects = fields.get("redirect_uris") if isinstance(fields, dict) else None
+                approved = (isinstance(fields, dict) and "client_secret" not in fields
+                    and fields.get("token_endpoint_auth_method") == "none"
+                    and isinstance(redirects, list) and bool(redirects)
+                    and all(isinstance(uri, str) and uri in provider.redirect_uris for uri in redirects))
+            except (ValueError, UnicodeError):
+                approved = False
+            if not approved:
+                return await JSONResponse({"error":"invalid_client_metadata"}, status_code=400,
+                    headers={"Cache-Control":"no-store"})(scope, receive, send)
+            sent = False
+            async def replay():
+                nonlocal sent
+                if not sent:
+                    sent = True
+                    return {"type":"http.request", "body":bytes(body), "more_body":False}
+                return await receive()
+            await self.downstream(scope, replay, send)
+
+    metadata_routes = [route for route in app.routes if getattr(route, "path", None) == "/.well-known/oauth-authorization-server"]
+    authorize_routes = [route for route in app.routes if getattr(route, "path", None) == "/authorize"]
+    register_routes = [route for route in app.routes if getattr(route, "path", None) == "/register"]
+    if len(metadata_routes) != 1 or len(authorize_routes) != 1 or len(register_routes) != 1:
+        raise ValueError("Pinned OAuth routes unavailable")
+    # Preserve all other SDK metadata, handlers, body limits, CORS and error rules.
+    metadata_routes[0].app = cors_middleware(MetadataHandler(metadata).handle, ["GET", "OPTIONS"])
+    authorize_routes[0].app = IssuerResponse(authorize_routes[0].app)
+    from starlette.middleware.cors import CORSMiddleware
+    if not isinstance(register_routes[0].app, CORSMiddleware):
+        raise ValueError("Pinned registration route unavailable")
+    # Keep SDK CORS outermost, including direct failures from the new guard.
+    register_routes[0].app.app = PublicRegistration(register_routes[0].app.app)
+
 def hashed(value):
     return hashlib.sha256(value.encode()).hexdigest()
 

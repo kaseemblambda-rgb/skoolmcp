@@ -20,7 +20,9 @@
     "catknows/hosted_tools.py",
     "catknows/hosted_membership.py",
     "hosted/deploy/requirements-gateway.txt",
-    "hosted/deploy/gateway.Dockerfile"
+    "hosted/deploy/gateway.Dockerfile",
+    "hosted/deploy/certs/supabase-prod-ca-2021.crt",
+    "hosted/deploy/certs/supabase-prod-ca-2021.crt.sha256"
   ],
   "browser": [
     "catknows/__init__.py",

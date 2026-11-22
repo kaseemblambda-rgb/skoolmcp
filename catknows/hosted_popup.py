@@ -6,14 +6,13 @@ import re
 import time
 from urllib.parse import urlsplit
 
-from mcp.server.auth.provider import construct_redirect_uri
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
 
 from .auth import Session
 from .hosted_connect import BrowserBridge, SCRIPT as KEYBOARD_SCRIPT
 from .hosted_keys import keyring, encrypt_session
-from .hosted_oauth import hashed, secret, skool_identity
+from .hosted_oauth import hashed, secret, skool_identity, authorization_redirect
 from .hosted_security import RateBudget, SECURITY_HEADERS, client_ip
 
 COOKIE = "__Host-stealth_oauth"
@@ -174,8 +173,8 @@ def routes(settings, provider, identity_reader=skool_identity, bridge_factory=Br
                 raise ValueError("Consent expired")
             req = row["request"]
             args = {"code":code} if data["approve"] else {"error":"access_denied"}
-            response = result({"redirect":construct_redirect_uri(req["redirect_uri"],state=req.get("state"),
-                iss=settings.public_origin,**args)})
+            response = result({"redirect":authorization_redirect(provider,req["redirect_uri"],
+                state=req.get("state"),**args)})
             if data["approve"]:
                 response.set_cookie(MANAGEMENT_COOKIE,management,secure=True,httponly=True,
                     samesite="strict",path="/",max_age=30*86400)

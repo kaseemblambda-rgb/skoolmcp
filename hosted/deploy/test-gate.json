@@ -11,9 +11,10 @@
     "test_hosted_analytics",
     "test_hosted_activity",
     "test_hosted_login",
-    "test_hosted_release_scope"
+    "test_hosted_release_scope",
+    "test_hosted_ca_oauth"
   ],
   "scope": "Hosted runtime and synthetic container checks only. Mac exporter, scheduler, reconciliation and updater suites are excluded.",
-  "expected_tests": 140,
+  "expected_tests": 156,
   "allow_skips": false
 }

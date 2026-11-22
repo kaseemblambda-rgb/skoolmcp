@@ -179,6 +179,8 @@ def build_app(settings: Settings, session_provider=None, connect_store=None, acc
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
             allowed_hosts=[urlsplit(settings.public_origin).netloc], allowed_origins=[settings.public_origin]),
     )
+    from .hosted_oauth import install_issuer_identification
+    install_issuer_identification(app, provider, server.settings.auth)
     if account_verifier is not None:
         # Explicit legacy fixture injection only; never used by the production entry point.
         from .hosted_connect import routes
