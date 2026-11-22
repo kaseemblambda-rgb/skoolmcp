@@ -57,7 +57,7 @@ def safe_login_lifecycle(value):
     fixed={"completion_started","completion_ok","session_received","consent_ready","oauth_complete",
         "stream_started","browser_command_failed"}
     fixed.update("completion_failed reason="+v for v in ("timeout","no_auth","no_waf","closed","denied"))
-    fixed.update("membership_check="+v for v in ("paid","not_paid","error"))
+    fixed.update("membership_check="+v for v in ("paid","owner","not_paid","error"))
     fixed.update("browser_command="+v for v in ("frame","input"))
     fixed.update("browser_reply="+v for v in ("frame","error"))
     fixed.update("stream_failed stage="+v for v in ("binding","browser","identity","membership","consent","input"))

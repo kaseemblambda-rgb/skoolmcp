@@ -169,9 +169,41 @@ def skool_identity(session):
         client.http._http.close()
 
 
+def verified_sfc_owner(session, expected_identity):
+    """Use only Skool responses under this session; no general owner/admin bypass."""
+    from .client import SkoolClient
+    from .normalize import maybe_json
+    client=SkoolClient(session)
+    client.http._http=ReadOnlyTransport(client.http._http)
+    try:
+        own=client.self_user().get("id")
+        if (not isinstance(expected_identity,str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}",expected_identity)
+            or own!=expected_identity):
+            raise ValueError("Skool identity unavailable")
+        group=client.group_info("stealth")
+        if not isinstance(group,dict) or group.get("name")!="stealth":
+            raise ValueError("SFC role unavailable")
+        group_id=group.get("id")
+        if not isinstance(group_id,str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}",group_id):
+            raise ValueError("SFC role unavailable")
+        owner=maybe_json((group.get("metadata") or {}).get("owner"))
+        if isinstance(owner,dict):
+            values=[owner[k] for k in ("id","userId") if k in owner]
+            if not values or any(value!=values[0] for value in values):
+                raise ValueError("SFC role unavailable")
+            owner=values[0]
+        if not isinstance(owner,str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}",owner):
+            raise ValueError("SFC role unavailable")
+        return group_id if owner==own else None
+    finally:
+        client.http._http.close()
+
+
 class SkoolOAuthProvider(OAuthAuthorizationServerProvider):
-    def __init__(self, settings, store=None, redirect_uris=None):
+    def __init__(self, settings, store=None, redirect_uris=None, owner_reader=verified_sfc_owner):
         self.settings = settings
+        self.owner_reader = owner_reader
+        self.owner_slots = asyncio.Semaphore(2)
         self.store = store or OAuthStore(settings)
         self.redirect_uris = frozenset(redirect_uris if redirect_uris is not None else
             json.loads(os.environ.get("HOSTED_OAUTH_REDIRECT_URIS", "[]")))
@@ -272,6 +304,41 @@ class SkoolOAuthProvider(OAuthAuthorizationServerProvider):
         return OAuthToken(access_token=access, refresh_token=refresh,
             expires_in=max(0, min(300, refresh_token.expires_at-int(time.time()))), scope="mcp:read")
 
+    async def owner_access(self, row, token):
+        """Recheck owner-only grants on every bearer use, using the bound saved session."""
+        try:
+            await asyncio.wait_for(self.owner_slots.acquire(),timeout=.1)
+        except TimeoutError:
+            return False
+        task=None
+        try:
+            def check():
+                from .hosted_keys import keyring
+                from .hosted_sessions import decrypt_session
+                saved=self.store.rpc("hosted_server_session",dict(p_account=row["account_id"],
+                    p_token_hash=hashed(token),p_resource=self.settings.resource))
+                if not saved:
+                    raise ValueError("Skool session unavailable")
+                _,keys=keyring();version=saved["key_version"]
+                session=decrypt_session(row["account_id"],saved,keys[version],version)
+                return self.owner_reader(session,row["skool_user_id"])
+            task=asyncio.create_task(asyncio.to_thread(check))
+            group_id=await asyncio.shield(task)
+            payload=dict(account_id=row["account_id"],skool_user_id=row["skool_user_id"])
+            if group_id is None or group_id!=row["sfc_group_id"]:
+                await self.call("owner_denied",**payload)
+                return False
+            return await self.call("owner_verified",**payload,group_id=group_id,token_hash=hashed(token)) is True
+        except asyncio.CancelledError:
+            if task:
+                try:await task
+                except Exception:pass
+            raise
+        except Exception:
+            return False  # Unavailable role data denies without destructive revocation.
+        finally:
+            self.owner_slots.release()
+
     async def load_access_token(self, token):
         if not isinstance(token, str) or not token.startswith("st_a_") or len(token) > 128:
             return None
@@ -281,6 +348,8 @@ class SkoolOAuthProvider(OAuthAuthorizationServerProvider):
                 return None
             expires = moment(row["expires_at"])
             if expires is None or expires.timestamp()<=time.time():
+                return None
+            if row.get("access_basis")=="sfc_owner" and not await self.owner_access(row,token):
                 return None
             return AccessToken(token=token, client_id=row["client_id"], subject=row["account_id"],
                 scopes=["mcp:read"], resource=row["resource"],

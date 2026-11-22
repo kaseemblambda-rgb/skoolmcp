@@ -247,11 +247,22 @@ def routes(settings, provider, identity_reader=skool_identity, bridge_factory=Br
                         raise ValueError("Invalid Skool identity")
                     stage = "membership"
                     account = await provider.call("account",skool_user_id=skool_id)
-                    if not account or await provider.call("paid",account_id=account["id"]) is not True:
+                    allowed=bool(account) and await provider.call("paid",account_id=account["id"]) is True
+                    owner=False
+                    if account and (not allowed or account.get("sfc_owner_verified_at") is not None):
+                        group_id=await asyncio.to_thread(provider.owner_reader,session,skool_id)
+                        if group_id is not None:
+                            owner=await provider.call("owner_verified",account_id=account["id"],
+                                skool_user_id=skool_id,group_id=group_id) is True
+                            allowed=owner and await provider.call("paid",account_id=account["id"]) is True
+                        elif account.get("sfc_owner_verified_at") is not None:
+                            await provider.call("owner_denied",account_id=account["id"],skool_user_id=skool_id)
+                            allowed=await provider.call("paid",account_id=account["id"]) is True
+                    if not allowed:
                         login_lifecycle("membership_check=not_paid")
                         await socket.send_json({"error":"Paid SFC membership is required."})
                         return
-                    login_lifecycle("membership_check=paid")
+                    login_lifecycle("membership_check=owner" if owner else "membership_check=paid")
                     stage = "consent"
                     version,keys = keyring()
                     encrypted = encrypt_session(account["id"],session,version,keys[version])

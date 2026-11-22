@@ -27,7 +27,7 @@ class SyntheticStore:
     """Unit-test adapter; production uses the SQL state machine, tested separately."""
     def __init__(self):
         self.clients={};self.flows={};self.accounts={};self.sessions={};self.codes={};self.tokens={}
-        self.paid={'synthetic-skool-a'}
+        self.paid={'synthetic-skool-a'};self.owners={}
     def call(self,op,**p):
         self.flows={k:v for k,v in self.flows.items()if v['expires']>time.time()}
         if op=='client_save':self.clients[p['client_id']]=p['metadata'];return True
@@ -63,7 +63,18 @@ class SyntheticStore:
         if op=='account':
             self.accounts.setdefault(p['skool_user_id'],{'id':str(uuid4()),'skool_user_id':p['skool_user_id']})
             return self.accounts[p['skool_user_id']]
-        if op=='paid':return any(a['id']==p['account_id']and k in self.paid for k,a in self.accounts.items())
+        if op=='owner_verified':
+            account=self.accounts.get(p['skool_user_id'])
+            if not account or account['id']!=p['account_id']:return False
+            self.owners[account['id']]=p['group_id'];account['sfc_owner_verified_at']='synthetic-current-time'
+            return True
+        if op=='owner_denied':
+            self.owners.pop(p['account_id'],None);self.sessions.pop(p['account_id'],None)
+            for a in self.accounts.values():
+                if a['id']==p['account_id']:a.pop('sfc_owner_verified_at',None)
+            self.tokens={k:v for k,v in self.tokens.items()if v['account_id']!=p['account_id']}
+            return True
+        if op=='paid':return p['account_id'] in self.owners or any(a['id']==p['account_id']and k in self.paid for k,a in self.accounts.items())
         if op=='code_get':
             row=self.codes.get(p['code_hash'])
             return row if row and not row['used']and row['client_id']==p['client_id']else None
@@ -77,7 +88,9 @@ class SyntheticStore:
             return {'account_id':row['account_id']}
         if op=='token_get':
             row=self.tokens.get(p['token_hash'])
-            return row if row and any(a['id']==row['account_id']and k in self.paid for k,a in self.accounts.items())else None
+            if not row or not (row['account_id']in self.owners or any(a['id']==row['account_id']and k in self.paid for k,a in self.accounts.items())):return None
+            owner=next((k for k,a in self.accounts.items()if a['id']==row['account_id']),None)
+            return {**row,'access_basis':'sfc_owner','skool_user_id':owner,'sfc_group_id':self.owners[row['account_id']]} if row['account_id']in self.owners else row
         if op=='job_release':return True
         if op=='disconnect':return None
         raise AssertionError('Unsupported synthetic operation')
@@ -102,7 +115,7 @@ class PopupTests(unittest.TestCase):
     def setUp(self):
         self.settings=Settings('https://mcp.example.test','https://db.example.test','synthetic',frozenset({'premium'}))
         self.store=SyntheticStore();self.callback='https://connector.example.test/callback'
-        self.provider=SkoolOAuthProvider(self.settings,self.store,[self.callback])
+        self.provider=SkoolOAuthProvider(self.settings,self.store,[self.callback],owner_reader=lambda session,identity:None)
         self.client=OAuthClientInformationFull(client_id='synthetic-client',client_name='Synthetic Connector',
             redirect_uris=[self.callback],scope='mcp:read',token_endpoint_auth_method='none',grant_types=['authorization_code','refresh_token'])
         asyncio.run(self.provider.register_client(self.client))
