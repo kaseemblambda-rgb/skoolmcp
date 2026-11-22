@@ -146,3 +146,123 @@ class OwnerFlowTests(unittest.TestCase):
                 with self.assertRaises(asyncio.CancelledError):await task
                 self.assertFalse(c.provider.owner_slots.locked())
         asyncio.run(check())
+
+
+class OwnerShapeAndDiagnosticsTests(unittest.TestCase):
+    def call(self,metadata,own='synthetic-self',expected='synthetic-self',extra=None):
+        from catknows.hosted_oauth import verified_sfc_owner
+        raw=SimpleNamespace(close=Mock())
+        client=SimpleNamespace(self_user=Mock(return_value={'id':own}),group_info=Mock(return_value={
+            'id':'synthetic-group','name':'stealth','metadata':metadata,**(extra or {})}),http=SimpleNamespace(_http=raw))
+        with patch('catknows.client.SkoolClient',return_value=client):
+            try:return verified_sfc_owner(Session('synthetic-cookie','synthetic-auth','synthetic-waf'),expected)
+            finally:raw.close.assert_called_once()
+
+    def test_observed_json_profile_shape_is_already_supported(self):
+        # Keys mirror the local shape-only observation. All values here are invented.
+        owner={key:'synthetic-private-field'for key in ('created_at','email','first_name','last_name','name','time_zone','updated_at')}
+        owner.update(id='synthetic-self',metadata={'synthetic':'private'})
+        with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+            self.assertEqual(self.call({'owner':json.dumps(owner),'created_by':'synthetic-self'}),'synthetic-group')
+        output='\n'.join(logs.output);self.assertIn('owner_check=owner_match',output)
+        for value in ('synthetic-self','synthetic-private-field','synthetic-cookie','synthetic-auth','synthetic-waf','synthetic-group'):
+            self.assertNotIn(value,output)
+
+    def test_owner_mismatch_has_distinct_fixed_category(self):
+        with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+            self.assertIsNone(self.call({'owner':json.dumps({'id':'synthetic-other'})}))
+        self.assertIn('owner_check=owner_mismatch','\n'.join(logs.output))
+        self.assertNotIn('owner_unavailable','\n'.join(logs.output))
+
+    def test_missing_owner_is_unavailable_not_mismatch(self):
+        with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+            with self.assertRaises(ValueError):self.call({})
+        self.assertIn('owner_check=owner_unavailable','\n'.join(logs.output))
+        self.assertNotIn('owner_mismatch','\n'.join(logs.output))
+
+    def test_contradictory_owner_identifiers_remain_unavailable(self):
+        with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+            with self.assertRaises(ValueError):self.call({'owner':json.dumps({'id':'synthetic-self','userId':'synthetic-other'})})
+        self.assertIn('owner_check=owner_unavailable','\n'.join(logs.output))
+
+    def test_creator_and_owner_like_fields_never_replace_owner_evidence(self):
+        with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+            self.assertIsNone(self.call({'owner':'synthetic-other','created_by':'synthetic-self','owner_id':'synthetic-self','role':'owner'},
+                extra={'creator':'synthetic-self','user_id':'synthetic-self'}))
+        self.assertIn('owner_check=owner_mismatch','\n'.join(logs.output))
+
+    def test_identity_mismatch_is_unavailable_and_never_logs_identifiers(self):
+        with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+            with self.assertRaises(ValueError):self.call({'owner':'synthetic-self'},expected='synthetic-forged')
+        output='\n'.join(logs.output);self.assertIn('owner_check=owner_unavailable',output)
+        self.assertNotIn('synthetic-self',output);self.assertNotIn('synthetic-forged',output)
+
+    def test_case_or_format_changes_do_not_create_identifier_equivalence(self):
+        with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+            self.assertIsNone(self.call({'owner':'Synthetic-Self'}))
+        self.assertIn('owner_check=owner_mismatch','\n'.join(logs.output))
+
+    def test_new_log_categories_are_finite_and_redacted(self):
+        import io,logging
+        from catknows.hosted_security import install_private_logging,login_lifecycle
+        previous=logging.getLogRecordFactory();out=io.StringIO();handler=logging.StreamHandler(out)
+        logger=logging.getLogger('stealth.hosted.login_lifecycle');logger.addHandler(handler)
+        try:
+            install_private_logging()
+            for value in ('owner_check=owner_match','owner_check=owner_mismatch','owner_check=owner_unavailable',
+                'account_lookup=unavailable','owner_attestation=accepted','owner_attestation=rejected','owner_access=rejected'):
+                login_lifecycle(value);self.assertIn(value,out.getvalue())
+            login_lifecycle('owner_check=owner_mismatch synthetic-secret')
+            logger.info('owner_check=owner_unavailable %s','synthetic-token')
+            try:raise ValueError('synthetic-cookie')
+            except ValueError:logger.exception('owner_check=owner_unavailable')
+            for secret in ('synthetic-secret','synthetic-token','synthetic-cookie','Traceback'):self.assertNotIn(secret,out.getvalue())
+        finally:logging.setLogRecordFactory(previous);logger.removeHandler(handler)
+
+
+class OwnerAdmissionDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        self.case=popup.PopupTests();self.case.setUp();self.addCleanup(self.case.doCleanups)
+
+    def test_attestation_rejection_can_produce_not_paid_without_owner_mismatch(self):
+        async def check():
+            c=self.case;c.store.paid.clear();c.provider.owner_reader=Mock(return_value='synthetic-group')
+            original=c.store.call
+            def call(op,**kwargs):return False if op=='owner_verified' else original(op,**kwargs)
+            c.store.call=call
+            async with c.app.router.lifespan_context(c.app):
+                await c.begin()
+                with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+                    messages=await c.stream()
+                self.assertEqual(messages,[{'error':'Paid SFC membership is required.'}]);c.provider.owner_reader.assert_called_once()
+                output='\n'.join(logs.output);self.assertIn('owner_attestation=rejected',output)
+                self.assertIn('membership_check=not_paid',output);self.assertNotIn('stream_failed',output)
+                self.assertEqual(c.store.owners,{});self.assertEqual(c.store.sessions,{})
+        asyncio.run(check())
+
+    def test_missing_account_can_produce_not_paid_without_owner_check(self):
+        async def check():
+            c=self.case;original=c.store.call
+            def call(op,**kwargs):return None if op=='account' else original(op,**kwargs)
+            c.store.call=call;c.provider.owner_reader=Mock(side_effect=AssertionError('must not read'))
+            async with c.app.router.lifespan_context(c.app):
+                await c.begin()
+                with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+                    messages=await c.stream()
+                self.assertEqual(messages,[{'error':'Paid SFC membership is required.'}]);c.provider.owner_reader.assert_not_called()
+                self.assertIn('account_lookup=unavailable','\n'.join(logs.output))
+        asyncio.run(check())
+
+    def test_accepted_attestation_but_paid_guard_denial_is_distinguishable(self):
+        async def check():
+            c=self.case;c.store.paid.clear();original=c.store.call
+            def call(op,**kwargs):return True if op=='owner_verified' else original(op,**kwargs)
+            c.store.call=call;c.provider.owner_reader=Mock(return_value='synthetic-group')
+            async with c.app.router.lifespan_context(c.app):
+                await c.begin()
+                with self.assertLogs('stealth.hosted.login_lifecycle',level='INFO') as logs:
+                    messages=await c.stream()
+                output='\n'.join(logs.output);self.assertIn('owner_attestation=accepted',output)
+                self.assertIn('owner_access=rejected',output);self.assertIn('error',messages[0])
+                self.assertEqual(c.store.sessions,{})
+        asyncio.run(check())

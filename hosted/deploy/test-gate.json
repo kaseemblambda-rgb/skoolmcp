@@ -17,6 +17,6 @@
     "test_hosted_sfc_owner"
   ],
   "scope": "Hosted runtime and synthetic container checks only. Mac exporter, scheduler, reconciliation and updater suites are excluded.",
-  "expected_tests": 231,
+  "expected_tests": 242,
   "allow_skips": false
 }

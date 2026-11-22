@@ -173,9 +173,11 @@ def verified_sfc_owner(session, expected_identity):
     """Use only Skool responses under this session; no general owner/admin bypass."""
     from .client import SkoolClient
     from .normalize import maybe_json
-    client=SkoolClient(session)
-    client.http._http=ReadOnlyTransport(client.http._http)
+    from .hosted_security import login_lifecycle
+    client=None
     try:
+        client=SkoolClient(session)
+        client.http._http=ReadOnlyTransport(client.http._http)
         own=client.self_user().get("id")
         if (not isinstance(expected_identity,str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}",expected_identity)
             or own!=expected_identity):
@@ -194,9 +196,17 @@ def verified_sfc_owner(session, expected_identity):
             owner=values[0]
         if not isinstance(owner,str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}",owner):
             raise ValueError("SFC role unavailable")
-        return group_id if owner==own else None
+        if owner!=own:
+            login_lifecycle("owner_check=owner_mismatch")
+            return None
+        login_lifecycle("owner_check=owner_match")
+        return group_id
+    except Exception:
+        login_lifecycle("owner_check=owner_unavailable")
+        raise
     finally:
-        client.http._http.close()
+        if client is not None:
+            client.http._http.close()
 
 
 class SkoolOAuthProvider(OAuthAuthorizationServerProvider):

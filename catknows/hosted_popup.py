@@ -247,6 +247,8 @@ def routes(settings, provider, identity_reader=skool_identity, bridge_factory=Br
                         raise ValueError("Invalid Skool identity")
                     stage = "membership"
                     account = await provider.call("account",skool_user_id=skool_id)
+                    if not account:
+                        login_lifecycle("account_lookup=unavailable")
                     allowed=bool(account) and await provider.call("paid",account_id=account["id"]) is True
                     owner=False
                     if account and (not allowed or account.get("sfc_owner_verified_at") is not None):
@@ -254,7 +256,10 @@ def routes(settings, provider, identity_reader=skool_identity, bridge_factory=Br
                         if group_id is not None:
                             owner=await provider.call("owner_verified",account_id=account["id"],
                                 skool_user_id=skool_id,group_id=group_id) is True
+                            login_lifecycle("owner_attestation=accepted" if owner else "owner_attestation=rejected")
                             allowed=owner and await provider.call("paid",account_id=account["id"]) is True
+                            if owner and not allowed:
+                                login_lifecycle("owner_access=rejected")
                         elif account.get("sfc_owner_verified_at") is not None:
                             await provider.call("owner_denied",account_id=account["id"],skool_user_id=skool_id)
                             allowed=await provider.call("paid",account_id=account["id"]) is True
