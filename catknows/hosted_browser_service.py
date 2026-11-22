@@ -16,6 +16,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 LOGIN="https://www.skool.com/login"
+SESSION_CAPTURE_TIMEOUT=2.0
 
 
 WAF_HOST = "017ae153ccc5.edge.sdk.awswaf.com"
@@ -136,6 +137,74 @@ class LoginBrowser:
     def __init__(self):
         self.network=LoginDiagnostics()
         self.page=None
+        self._login_succeeded=False
+        self._completion=None
+        self._navigation_denied=False
+        self._closed=False
+
+    def password_request(self, request):
+        try:
+            frame=request.frame
+            parsed=urlsplit(request.url)
+            return (frame.page is self.page and frame is self.page.main_frame
+                and request.method=="POST" and request.resource_type in ("fetch","xhr")
+                and parsed.hostname=="api2.skool.com" and parsed.path=="/auth/login"
+                and allowed_request(request.url,request.method,request.resource_type,True))
+        except Exception:
+            return False
+
+    def observe_response(self, response):
+        """Only this browser's password POST response can arm login completion."""
+        if self._closed:
+            return
+        self.network.response(response.url,response.status)
+        try:
+            if (self._completion is None and response.url==response.request.url
+                and self.password_request(response.request)):
+                self._login_succeeded=response.status==200
+        except Exception:
+            pass  # Missing/foreign request context is never authentication evidence.
+
+    def success_redirect(self, url):
+        return (not self._closed and not self._navigation_denied and self._login_succeeded
+            and url in ("https://www.skool.com/","https://www.skool.com:443/"))
+
+    async def read_session(self):
+        from .auth import _cookies_to_session
+        # Retain the original origin-scoped cookie path. No page JS or raw response body.
+        return _cookies_to_session(await self.context.cookies(["https://www.skool.com/"]))
+
+    async def capture_session(self):
+        """Bound the cookie-settling race; never return an incomplete session."""
+        deadline=asyncio.get_running_loop().time()+SESSION_CAPTURE_TIMEOUT
+        try:
+            while not self._closed and not self._navigation_denied:
+                remaining=deadline-asyncio.get_running_loop().time()
+                if remaining<=0:
+                    break
+                session=await asyncio.wait_for(self.read_session(),timeout=remaining)
+                if session.is_valid and session.waf_token:
+                    return session
+                await asyncio.sleep(min(.05,remaining))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        raise ValueError("Skool session unavailable") from None
+
+    def begin_completion(self):
+        if self._closed or self._navigation_denied or not self._login_succeeded:
+            raise ValueError("Skool login unavailable")
+        if self._completion is None:
+            self._completion=asyncio.create_task(self.capture_session())
+        return self._completion
+
+    def session_result(self, session):
+        if self._closed or self._navigation_denied or not session.is_valid or not session.waf_token:
+            raise ValueError("Skool login unavailable")
+        self.network.log()
+        return {"session":{"cookie_header":session.cookie_header,
+            "auth_token":session.auth_token,"waf_token":session.waf_token}}
 
     async def start(self):
         from playwright.async_api import async_playwright
@@ -149,7 +218,7 @@ class LoginBrowser:
         self.context=await self.browser.new_context(viewport={"width":1024,"height":768},
             accept_downloads=False,service_workers="block",permissions=[])
         await self.context.add_init_script(PASSWORD_ONLY)
-        self.context.on("response",lambda response:self.network.response(response.url,response.status))
+        self.context.on("response",self.observe_response)
         self.context.on("requestfailed",lambda request:self.network.failed())
         await self.context.route("**/*",self.route_request)
         # No page-created sockets, and no navigation can escape through a new page.
@@ -166,7 +235,21 @@ class LoginBrowser:
             asyncio.create_task(page.close())
 
     async def check_navigation(self, frame):
+        if self._closed:
+            return
+        if frame is self.page.main_frame and self.success_redirect(frame.url):
+            self.begin_completion()
+            try:
+                await self.page.evaluate("window.stop()")
+            except Exception:
+                pass  # Completion still requires valid cookies, with a fixed timeout.
+            return
+        if (frame is self.page.main_frame and self._completion is not None
+            and not self._navigation_denied and frame.url=="chrome-error://chromewebdata/"):
+            # A deliberately stopped success navigation must not destroy cookie capture.
+            return
         if frame is self.page.main_frame and not allowed_request(frame.url,"GET","document",True):
+            self._navigation_denied=True
             from .hosted_security import blocked_host, blocked_request
             try: host=urlsplit(frame.url).hostname or "invalid-host"
             except ValueError: host="invalid-host"
@@ -179,13 +262,27 @@ class LoginBrowser:
         request=route.request
         try:
             frame=request.frame
+            if (frame.page is self.page and frame is self.page.main_frame and request.method=="GET"
+                and request.resource_type=="document" and self.success_redirect(request.url)):
+                self.begin_completion()
+                # 204 stops document navigation without fetching the homepage or producing
+                # the error document caused by route.abort(). Keep the login DOM until ready.
+                await route.fulfill(status=204,headers={"Cache-Control":"no-store"},body="")
+                return
             accepted=(frame.page is self.page and allowed_request(request.url,request.method,
                 request.resource_type,frame is self.page.main_frame))
         except Exception:
             accepted=False
         if accepted:
+            if self._completion is None and self.password_request(request):
+                self._login_succeeded=False  # A fresh attempt needs its own successful response.
             await route.continue_()
         else:
+            try:
+                if frame.page is self.page and frame is self.page.main_frame and request.resource_type=="document":
+                    self._navigation_denied=True
+            except Exception:
+                pass
             self.network.blocked()
             try: host=urlsplit(request.url).hostname or "invalid-host"
             except ValueError: host="invalid-host"
@@ -193,7 +290,7 @@ class LoginBrowser:
             blocked_request(request.url,request.method,request.resource_type)
             await route.abort("blockedbyclient")
 
-    async def command(self, command):
+    async def interact(self, command):
         kind=command.get("type")
         if kind=="click":
             x,y=command.get("x"),command.get("y")
@@ -227,20 +324,48 @@ class LoginBrowser:
             await self.page.keyboard.press("+".join([*modifiers,key]))
         elif kind!="frame":
             raise ValueError("Invalid command")
-        from .auth import _cookies_to_session
-        # Only cookies for Skool's own URL enter the saved session.
-        session=_cookies_to_session(await self.context.cookies(["https://www.skool.com/"]))
+
+    async def command(self, command):
+        if self._closed or self._navigation_denied:
+            raise ValueError("Skool login unavailable")
+        if self._completion is not None:
+            return self.session_result(await self._completion)
+        try:
+            await self.interact(command)
+        except Exception:
+            if self._completion is None:
+                raise
+            # Playwright may report an interrupted click/load after the local 204.
+            # Only a genuine, already latched success can switch to cookie capture.
+        if self._completion is not None:
+            return self.session_result(await self._completion)
+        session=await self.read_session()
         self.network.log()
         if session.is_valid and session.waf_token:
-            return {"session":{"cookie_header":session.cookie_header,
-                    "auth_token":session.auth_token,"waf_token":session.waf_token}}
-        frame=await self.page.screenshot(type="jpeg",quality=65)
+            return self.session_result(session)
+        if self._completion is not None:
+            return self.session_result(await self._completion)
+        try:
+            frame=await self.page.screenshot(type="jpeg",quality=65)
+        except Exception:
+            if self._completion is None:
+                raise
+        if self._completion is not None:
+            return self.session_result(await self._completion)
         challenge=any(urlsplit(frame.url).hostname=="challenges.cloudflare.com"
                       for frame in getattr(self.page,"frames",[]))
         return {"frame":base64.b64encode(frame).decode(),
                 "diagnostics":self.network.snapshot(session,challenge)}
 
     async def close(self):
+        self._closed=True
+        self._login_succeeded=False
+        completion=self._completion
+        self._completion=None
+        if completion is not None:
+            if not completion.done():
+                completion.cancel()
+            await asyncio.gather(completion,return_exceptions=True)
         try:
             if hasattr(self,"browser"):
                 await self.browser.close()
